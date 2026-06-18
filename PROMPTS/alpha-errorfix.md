@@ -8,8 +8,6 @@ Your task is to analyze failed alphas and generate improved versions while stric
 
 ### 1. Operators Documentation (`operators.md`)
 
-This file contains all allowed operators.
-
 Requirements:
 
 * Parse the entire file before generating anything.
@@ -18,7 +16,7 @@ Requirements:
 
 ### 2. Alpha Code(s)
 
-I will provide one or more alpha expressions.
+I may provide one or more alpha expressions.
 
 ### 3. Alpha Failures / Simulation Results
 
@@ -32,11 +30,11 @@ I may provide:
 * Correlation
 * Weight concentration
 * Drawdown
-* Any platform error messages
+* Platform error messages
 
 ### 4. Simulation Settings
 
-I may provide settings such as:
+I may provide:
 
 * Instrument Type
 * Region
@@ -55,33 +53,33 @@ I may provide settings such as:
 
 1. Automatically detect all datafields already used inside the provided alpha(s).
 
-2. Treat those detected datafields as the available dataset.
+2. Treat those detected datafields as the only available dataset.
 
 3. Never ask me to upload or provide additional datafields.
 
 4. Never assume new datafields exist.
 
-5. If a new alpha variant requires information that is unavailable, build the alternative using only:
+5. If a new alpha variant requires unavailable information, build the alternative using only:
 
    * Existing detected datafields
    * Allowed operators
 
 6. Do NOT request any missing files if:
 
-   * `operators.md` is available
-   * Alpha codes are available
+   * `operators.md` is provided
+   * Alpha codes are provided
 
 Work only with the supplied information.
 
 ---
 
-## Your Objective
+## Objective
 
 For EACH failed alpha:
 
 ### Step 1: Diagnose the failure
 
-Briefly identify:
+Identify:
 
 * Why the alpha likely failed
 * Which metrics are problematic
@@ -89,9 +87,11 @@ Briefly identify:
 
 ### Step 2: Generate FOUR improved alpha variants
 
-Each variant must use a different approach.
+Generate four distinct approaches.
 
 ### Variant 1: Noise Reduction
+
+Requirements:
 
 * Smooth signals
 * Reduce overreaction
@@ -99,15 +99,21 @@ Each variant must use a different approach.
 
 ### Variant 2: Signal Transformation
 
+Requirements:
+
 * Change ranking, scaling, normalization, or temporal construction
 * Preserve the original idea
 
 ### Variant 3: Orthogonal Diversification
 
+Requirements:
+
 * Reduce correlation
 * Capture a related but distinct effect
 
 ### Variant 4: Stronger Alternative
+
+Requirements:
 
 * Rebuild the alpha using the same hypothesis
 * Produce a potentially stronger signal
@@ -116,13 +122,13 @@ Each variant must use a different approach.
 
 ## Strict Constraints
 
-1. Only use operators from `operators.md`.
+1. Use ONLY operators from `operators.md`.
 
-2. Only use datafields already present in the alpha(s).
+2. Use ONLY datafields already present in the alpha(s).
 
-3. Never invent unavailable operators.
+3. Never invent operators.
 
-4. Never invent unavailable datafields.
+4. Never invent datafields.
 
 5. Respect all simulation settings.
 
@@ -144,21 +150,21 @@ Each variant must use a different approach.
 
 ---
 
-## Output Format
+# Output Format
 
-### Original Alpha
+## Original Alpha
 
 ```text
 [paste alpha]
 ```
 
-### Detected Datafields
+## Detected Datafields
 
 ```text
-[automatically list detected datafields]
+[list automatically detected datafields]
 ```
 
-### Failure Analysis
+## Failure Analysis
 
 * Issue:
 * Cause:
@@ -166,56 +172,112 @@ Each variant must use a different approach.
 
 ---
 
-### Alpha Variant 1 (Noise Reduction)
+## Alpha Variant 1 (Noise Reduction)
 
-Idea:
+**Idea:**
 
-Alpha:
+**Alpha:**
 
 ```text
 [alpha]
 ```
 
-Expected improvement:
+**Expected Improvement:**
 
 ---
 
-### Alpha Variant 2 (Signal Transformation)
+## Alpha Variant 2 (Signal Transformation)
 
-Idea:
+**Idea:**
 
-Alpha:
+**Alpha:**
 
 ```text
 [alpha]
 ```
 
-Expected improvement:
+**Expected Improvement:**
 
 ---
 
-### Alpha Variant 3 (Orthogonal Diversification)
+## Alpha Variant 3 (Orthogonal Diversification)
 
-Idea:
+**Idea:**
 
-Alpha:
+**Alpha:**
 
 ```text
 [alpha]
 ```
 
-Expected improvement:
+**Expected Improvement:**
 
 ---
 
-### Alpha Variant 4 (Stronger Alternative)
+## Alpha Variant 4 (Stronger Alternative)
 
-Idea:
+**Idea:**
 
-Alpha:
+**Alpha:**
 
 ```text
 [alpha]
 ```
 
-Expected improvement:
+**Expected Improvement:**
+
+---
+
+# INPUT SECTION (PASTE BELOW)
+
+## 📄 OPERATORS.MD
+
+```text
+PASTE operators.md HERE
+```
+
+---
+
+## 📈 ALPHA CODE(S)
+
+```text
+PASTE ALPHA CODE(S) HERE
+```
+
+---
+
+## ❌ ALPHA FAILURES / SIMULATION RESULTS
+
+```text
+PASTE FAILURES HERE
+
+Example:
+
+Fitness:
+Sharpe:
+Returns:
+Turnover:
+Sub-universe Sharpe:
+Correlation:
+Weight Concentration:
+Drawdown:
+Error Messages:
+```
+
+---
+
+## ⚙️ SIMULATION SETTINGS
+
+```text
+Instrument Type:
+Region:
+Universe:
+Language:
+Delay:
+Decay:
+Neutralization:
+Truncation:
+Pasteurization:
+Max Position:
+Max Trade:
+```
