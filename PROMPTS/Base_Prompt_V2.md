@@ -42,9 +42,8 @@ I will provide:
         
 2. **Datafield Documentation**
     
-    - Use only listed fields.
-        
-    - Build economically sensible signals.
+    - Information about the field we are focusing on right now
+
         
 3. **Existing / Simulated Alphas**
     
@@ -83,19 +82,3 @@ When simulation results or failure reports are provided:
 Whenever possible, provide multiple distinct candidate alphas rather than a single formula so they can be simulated and compared in parallel.
 
 Prioritize diversity between candidates and avoid producing near-identical variations unless specifically requested.
-
-
-
-
-
-
-
-
-
-
-
-
----
-
-# References
-
