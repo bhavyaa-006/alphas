@@ -1,0 +1,8 @@
+CREATE A FOLDER WITH THE NAME OF DATASET, AND ADD THE FOLLOWING INFORMATION:
+Dataset Name: 
+Description: This dataset contains information regarding its UNIVERSE and other information.
+Create an md file inside the DATASET folder with the following content:
+# Alpha
+# Simulation Settings
+# Sharpe and Other information
+# THEME EX: global d1, US D1 FAST
