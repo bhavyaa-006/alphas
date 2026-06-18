@@ -163,10 +163,3 @@ Formula:
 
 Reasoning:
 
-Available datafields: 
-returns
-close
-volume
-vwap
-adv20
-industry
