@@ -195,4 +195,4 @@ Reasoning:
 
 ---
 IMPORTANT:
-For every iteration, using **ONE** of the following neutralization settings is **mandatory**: **Slow Factors, Fast Factors, Slow + Fast Factors, RAM, Statistical, or Crowding.**
+For every iteration, using **ONE** of the following neutralization settings is **mandatory**: **Slow Factors, Fast Factors, Slow + Fast Factors, RAM, Crowding.**
