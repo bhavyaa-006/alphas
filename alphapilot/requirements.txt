@@ -1,0 +1,5 @@
+requests>=2.31
+pandas>=2.0
+tqdm>=4.65
+PyYAML>=6.0
+jinja2

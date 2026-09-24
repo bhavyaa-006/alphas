@@ -1,0 +1,35 @@
+services:
+  # One-off mode: a fresh container per command, removed when it exits.
+  #   docker compose run --rm alphapilot            (menu)
+  #   docker compose run --rm alphapilot doctor
+  alphapilot:
+    build: .
+    image: alphapilot:latest
+    volumes:
+      - ./data:/data            # config.yaml, state/, session.json, .env, logs - all persist here
+    environment:
+      - BRAIN_CREDENTIAL_EMAIL=${BRAIN_CREDENTIAL_EMAIL:-}
+      - BRAIN_CREDENTIAL_PASSWORD=${BRAIN_CREDENTIAL_PASSWORD:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+    stdin_open: true
+    tty: true
+
+  # Persistent mode: one container that stays running in the background
+  # (survives until you `docker compose down`, and restarts itself if Docker
+  # or the machine restarts). Send it commands with `docker compose exec`.
+  #   docker compose up -d alphapilot-daemon
+  #   docker compose exec alphapilot-daemon alphapilot        (menu)
+  #   docker compose exec alphapilot-daemon alphapilot run
+  alphapilot-daemon:
+    build: .
+    image: alphapilot:latest
+    volumes:
+      - ./data:/data
+    environment:
+      - BRAIN_CREDENTIAL_EMAIL=${BRAIN_CREDENTIAL_EMAIL:-}
+      - BRAIN_CREDENTIAL_PASSWORD=${BRAIN_CREDENTIAL_PASSWORD:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
+    entrypoint: ["tail", "-f", "/dev/null"]   # idles - alphapilot itself only runs via `exec`
+    restart: unless-stopped
