@@ -152,6 +152,56 @@ def _errors_screen(home: Path):
     _pause()
 
 
+def _retry_screen(home: Path):
+    """Interactively reset errored expressions back to pending."""
+    cfg = CFG.load_config(home)
+    db = C._state_db_path(home, cfg.pack)
+    if not db.exists():
+        print(f"No progress yet for pack {cfg.pack!r}.")
+        _pause()
+        return
+    store = ST.Store(db)
+    n_err = store.counts().get("error", 0)
+    summary = store.error_summary(10)
+    store.close()
+    if n_err == 0:
+        print(f"\nNo errored expressions for pack {cfg.pack!r} - nothing to retry.")
+        _pause()
+        return
+    banner([f"Retry errors  ({n_err} errored expression(s))"])
+    if summary:
+        print("Top error groups:")
+        for row in summary:
+            print(f"  x{row['count']:<4} {row['example'][:140]}")
+    print()
+    choice = _prompt_choice("Retry options", [
+        (f"Retry ALL {n_err} errored expression(s)", "all"),
+        ("Retry only errors matching a keyword (e.g. '504', 'server error')", "filter"),
+    ])
+    if choice is None:
+        return
+    pattern = ""
+    if choice == "filter":
+        pattern = input("  Filter text (case-insensitive substring of error message): ").strip()
+        if not pattern:
+            print("  No filter entered, cancelling.")
+            _pause()
+            return
+    reset_att = input("  Also reset attempt counters? This gives each expression the full retry budget again. [y/N] ").strip().lower() == "y"
+    store = ST.Store(db)
+    n = store.retry_errors(pattern=pattern, reset_attempts=reset_att)
+    store.close()
+    if n == 0:
+        print(f"  No rows matched{' filter ' + repr(pattern) if pattern else ''} - nothing changed.")
+    else:
+        label = f" matching {pattern!r}" if pattern else ""
+        print(f"  Reset {n} expression(s){label} back to pending.")
+        if reset_att:
+            print("  (attempt counters zeroed)")
+        print("  Run 'Run' from the main menu (or `alphapilot run`) to re-simulate them.")
+    _pause()
+
+
 def _submissions_screen(home: Path):
     C.cmd_submissions(_args(home))
     _pause()
@@ -294,6 +344,7 @@ def main_menu(home_arg=None):
             ("Status", "status"),
             ("Fields (per-field progress)", "fields"),
             ("View errors", "errors"),
+            ("Retry errors (reset failed simulations back to pending)", "retry"),
             ("Submissions history", "submissions"),
             ("Jump to alpha # (skip ahead / reset)", "jump"),
             ("Settings (pack, submit mode, LLM provider, ...)", "settings"),
@@ -313,6 +364,8 @@ def main_menu(home_arg=None):
                 _fields_screen(home)
             elif choice == "errors":
                 _errors_screen(home)
+            elif choice == "retry":
+                _retry_screen(home)
             elif choice == "submissions":
                 _submissions_screen(home)
             elif choice == "jump":

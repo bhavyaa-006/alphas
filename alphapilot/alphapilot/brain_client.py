@@ -182,6 +182,39 @@ def ensure_session(ace, cfg, home, force_relogin: bool = False, on_persona_link=
             poll_seconds=cfg.session.persona_poll_seconds,
             on_waiting=on_waiting,
         )
+        # BRAIN needs ~2 minutes to propagate the face-check session server-side.
+        # Jumping straight into simulations after a face check reliably causes errors,
+        # so we wait here with a visible countdown.
+        _FACE_CHECK_COOLDOWN_S = 120
+        _COOLDOWN_ANNOUNCE_EVERY = 15
+        util.say(
+            f"Face check confirmed - waiting {_FACE_CHECK_COOLDOWN_S // 60} min "
+            "for BRAIN to propagate the session before continuing..."
+        )
+        waited = 0
+        while waited < _FACE_CHECK_COOLDOWN_S:
+            chunk = min(_COOLDOWN_ANNOUNCE_EVERY, _FACE_CHECK_COOLDOWN_S - waited)
+            time.sleep(chunk)
+            waited += chunk
+            remaining = _FACE_CHECK_COOLDOWN_S - waited
+            if remaining > 0:
+                util.say(f"  ...{remaining}s left")
+
+        # Re-authenticate after the cooldown so the session object receives a proper
+        # HTTP 201 /authentication response with the fully-propagated server-side cookies.
+        # Without this, the session was only authenticated via the persona endpoint and
+        # never got a confirmed /authentication 201 - causing the first simulation batch
+        # to fail with auth errors even though the face check itself succeeded.
+        util.say("Re-authenticating to confirm session is fully active...")
+        post_status, post_extra = authenticate_once(s, ace.brain_api_url)
+        if post_status == "persona":
+            # Extremely unlikely (would mean another face check required immediately after),
+            # but handle it gracefully rather than silently using a broken session.
+            LOGGER.warning(
+                "Unexpected second persona challenge after face-check cooldown (%s) - "
+                "the session may not be fully propagated yet. Proceeding anyway.", post_extra
+            )
+        LOGGER.info("Post-cooldown re-authentication: status=%s", post_status)
 
     if cfg.session.reuse_cookies:
         save_cookies(s, home)

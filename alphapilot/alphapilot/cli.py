@@ -226,10 +226,13 @@ def cmd_run(args):
             stopped_reason = E._check_daily_cap(store, cfg).reason
 
     batches_since_submit_check = 0
+    total_batches_run = 0
     try:
         while not store.is_done(focus):
-            def on_progress(rs, counts):
-                say(f"batch {rs.batches_run}: ok={rs.simulated_ok} err={rs.simulated_err}  |  pool: {counts}")
+            total_batches_run += 1
+            _batch_num = total_batches_run  # capture now; default arg avoids late-binding closure bug
+            def on_progress(rs, counts, _n=_batch_num):
+                say(f"batch {_n}: ok={rs.simulated_ok} err={rs.simulated_err}  |  pool: {counts}")
 
             E.run_simulation_batches(ace, s, cfg, pack, store, on_progress=on_progress, max_batches=1, focus=focus)
             batches_since_submit_check += 1
@@ -330,6 +333,38 @@ def cmd_reset(args):
     print("state cleared:", db)
 
 
+def cmd_retry(args):
+    """Reset errored expressions back to pending so they are picked up on the next `run`."""
+    home = _resolve_home(args)
+    cfg = C.load_config(home, getattr(args, "set", []))
+    db = _state_db_path(home, cfg.pack)
+    if not db.exists():
+        print(f"No progress yet for pack {cfg.pack!r} (nothing run there so far).")
+        return 0
+    store = ST.Store(db)
+    counts_before = store.counts()
+    n_err = counts_before.get("error", 0)
+    if n_err == 0:
+        print(f"No errored expressions for pack {cfg.pack!r} - nothing to retry.")
+        store.close()
+        return 0
+    pattern = args.filter or ""
+    n = store.retry_errors(pattern=pattern, reset_attempts=args.reset_attempts)
+    store.close()
+    if n == 0:
+        if pattern:
+            print(f"No error rows matched filter {pattern!r}. Try without --filter to retry all.")
+        else:
+            print("No rows were reset (all errors may have exhausted max_attempts already).")
+    else:
+        label = f" matching {pattern!r}" if pattern else ""
+        print(f"Reset {n} errored expression(s){label} back to pending for pack {cfg.pack!r}.")
+        if args.reset_attempts:
+            print("  (attempt counters zeroed - each gets the full budget again)")
+        print("  Now run `alphapilot run` to re-simulate them.")
+    return 0
+
+
 def cmd_menu(args):
     from . import menu
 
@@ -416,6 +451,24 @@ def build_parser():
     sp.add_argument("--yes", action="store_true")
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_reset)
+
+    sp = sub.add_parser(
+        "retry-errors",
+        help="reset errored expressions back to pending so they are re-simulated on the next `run` "
+             "(useful when errors are transient server-side failures)",
+    )
+    sp.add_argument(
+        "--filter", default="", metavar="TEXT",
+        help="only retry errors whose message contains TEXT (case-insensitive). "
+             "e.g. --filter 'server error'  or  --filter '504'",
+    )
+    sp.add_argument(
+        "--reset-attempts", action="store_true", dest="reset_attempts",
+        help="also zero the attempt counter so each expression gets the full max_attempts budget again "
+             "(by default the existing count is kept)",
+    )
+    sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
+    sp.set_defaults(func=cmd_retry)
 
     return p
 

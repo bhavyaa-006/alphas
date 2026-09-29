@@ -355,6 +355,36 @@ class Store:
                 (error[:2000], utcnow_iso(), expr),
             )
 
+    def retry_errors(self, pattern: str = "", reset_attempts: bool = False) -> int:
+        """
+        Reset errored expressions back to 'pending' so they are picked up on
+        the next `run`.  If `pattern` is given (case-insensitive substring),
+        only rows whose error message contains that string are reset.  If
+        `reset_attempts` is True the attempt counter is also zeroed, giving
+        each expression the full max_attempts budget again; otherwise the
+        existing count is kept (so max_attempts is still respected).
+        Returns the number of rows that were reset.
+        """
+        now = utcnow_iso()
+        if reset_attempts:
+            attempt_sql = "attempts=0, "
+        else:
+            attempt_sql = ""
+        with self._tx():
+            if pattern:
+                cur = self.conn.execute(
+                    f"UPDATE alphas SET status='pending', {attempt_sql}error=NULL, updated_at=? "
+                    "WHERE status='error' AND instr(lower(error), lower(?))",
+                    (now, pattern),
+                )
+            else:
+                cur = self.conn.execute(
+                    f"UPDATE alphas SET status='pending', {attempt_sql}error=NULL, updated_at=? "
+                    "WHERE status='error'",
+                    (now,),
+                )
+        return cur.rowcount
+
     def mark_check(self, expr, result: str, detail: str):
         with self._tx():
             self.conn.execute(
