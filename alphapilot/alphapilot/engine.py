@@ -374,6 +374,7 @@ def run_submission_cycle(ace, s, cfg, pack, store: Store, ask_fn: Optional[Calla
                     say("    alpha page said: " + ", ".join(f"{r['name']}={r['result']}" for _, r in page.iterrows() if r["result"] != "PASS"))
                 continue
             if pending:
+                store.mark_check(cand.expr, "PENDING", f"still pending: {pending}")
                 say(f"    still PENDING ({pending}) - will retry next cycle")
                 continue
 
@@ -428,11 +429,18 @@ def run_submission_cycle(ace, s, cfg, pack, store: Store, ask_fn: Optional[Calla
             say(f"    RAW from BRAIN:\n{outcome.raw}")
             store.log_event("submit_halt", f"{cand.alpha_id}: {outcome.detail}\n{outcome.raw}")
             notify(cfg, f"alphapilot: HALTED during submit of {cand.alpha_id}: {outcome.detail}")
-            raise EngineHalt(
-                f"Submission outcome for {cand.alpha_id} is unclear ({outcome.stage}, HTTP {outcome.status_code}): "
-                f"{outcome.detail}\nStopping so nothing is submitted twice. Check the alpha on the platform, "
-                f"then re-run: https://platform.worldquantbrain.com/alpha/{cand.alpha_id}"
-            )
+            _SKIP_THIS_PROCESS.add(cand.expr)
+            store.mark_check(cand.expr, "UNSURE", f"{outcome.stage}: {outcome.detail}")
+            if getattr(cfg.submit, "halt_on_unsure", False):
+                raise EngineHalt(
+                    f"Submission outcome for {cand.alpha_id} is unclear ({outcome.stage}, HTTP {outcome.status_code}): "
+                    f"{outcome.detail}\nStopping so nothing is submitted twice. Check the alpha on the platform, "
+                    f"then re-run: https://platform.worldquantbrain.com/alpha/{cand.alpha_id}"
+                )
+            say(f"    UNSURE outcome ({outcome.stage}, HTTP {outcome.status_code}): {outcome.detail}")
+            say(f"    Skipping {cand.alpha_id} for this run to avoid duplicate submit. Moving to next candidate in batch.")
+            say(f"    Check when ready: https://platform.worldquantbrain.com/alpha/{cand.alpha_id}")
+            continue
         else:
             store.mark_submit_rejected(cand.expr, f"{outcome.stage}: {outcome.detail}\n{outcome.raw}")
             say(f"    rejected: {outcome.detail}")
@@ -440,3 +448,85 @@ def run_submission_cycle(ace, s, cfg, pack, store: Store, ask_fn: Optional[Calla
             store.log_event("submit_rejected_raw", f"{cand.alpha_id}\n{outcome.raw}")
 
     return submitted_this_run
+
+
+def check_candidate_platform(ace, s, cand: Alpha, store: Store, cfg) -> tuple[str, str]:
+    """
+    Checks the platform status and correlation tests for a candidate without submitting.
+    Returns (status, message), e.g. ("PASS", ...), ("FAIL", ...), ("ACTIVE", ...), ("PENDING", ...)
+    """
+    st = _platform_status(ace, s, cand.alpha_id)
+    if st == "ACTIVE":
+        store.mark_submitted(cand.expr, cand.alpha_id, "(submitted outside alphapilot)", "", "manual", cfg.submit.timezone)
+        return "ACTIVE", f"{cand.alpha_id} is already ACTIVE on platform (marked as submitted)"
+
+    api_checks = ace.get_check_submission(s, cand.alpha_id)
+    if api_checks is None or len(api_checks) == 0:
+        store.mark_check(cand.expr, "UNKNOWN", "get_check_submission returned nothing")
+        return "UNKNOWN", "get_check_submission returned nothing"
+
+    def _verdict():
+        page = _alpha_page_checks(ace, s, cand.alpha_id)
+        use = page if page is not None else api_checks
+        f = use.loc[use["result"] == "FAIL", "name"].tolist() if "result" in use.columns else []
+        p = use.loc[use["result"] == "PENDING", "name"].tolist() if "result" in use.columns else []
+        return page, use, f, p
+
+    page, use, failed, pending = _verdict()
+    if failed:
+        time.sleep(3)
+        page, use, failed, pending = _verdict()
+    if failed:
+        detail = _fmt_fails(use, failed)
+        store.mark_check(cand.expr, "FAIL", f"failed: {detail}")
+        return "FAIL", f"rejected: {detail}"
+    if pending:
+        store.mark_check(cand.expr, "PENDING", f"still pending: {pending}")
+        return "PENDING", f"still pending ({pending})"
+
+    store.mark_check(cand.expr, "PASS", "all checks passed")
+    return "PASS", "all checks passed"
+
+
+def submit_candidate_now(ace, s, cfg, pack, store: Store, cand: Alpha) -> tuple[bool, str]:
+    """
+    Submits a single candidate alpha, handling metadata, properties, and submission polling.
+    Returns (success, message).
+    """
+    st = _platform_status(ace, s, cand.alpha_id)
+    if st == "ACTIVE":
+        store.mark_submitted(cand.expr, cand.alpha_id, "(submitted outside alphapilot)", "", "manual", cfg.submit.timezone)
+        return True, f"{cand.alpha_id} is already ACTIVE on platform (marked as submitted)"
+
+    meta = LLM.generate_metadata(
+        cfg, cand.expr, pack.fields, pack.name, _settings_text(pack),
+        {"sharpe": cand.sharpe, "fitness": cand.fitness, "turnover": cand.turnover},
+    )
+    resp = ace.set_alpha_properties(
+        s, cand.alpha_id, name=meta.name, category=meta.category,
+        regular_desc=meta.description, tags=meta.tags,
+    )
+    if resp.status_code // 100 != 2:
+        meta = LLM.template_metadata(cand.expr, pack.fields, pack.name)
+        resp = ace.set_alpha_properties(
+            s, cand.alpha_id, name=meta.name, category=meta.category,
+            regular_desc=meta.description, tags=meta.tags,
+        )
+    if resp.status_code // 100 != 2:
+        return False, f"Could not save properties (HTTP {resp.status_code}): {resp.text[:300]}"
+
+    outcome = BC.submit_alpha(ace, s, cand.alpha_id, timeout_s=cfg.submit.timeout_min * 60, poll_every_s=cfg.submit.poll_seconds)
+    if outcome.ok:
+        store.mark_submitted(cand.expr, cand.alpha_id, meta.name, meta.category, meta.source, cfg.submit.timezone)
+        store.log_event("submitted", cand.alpha_id)
+        notify(cfg, f"alphapilot: submitted {cand.alpha_id} ({meta.name}, {pack.name})")
+        return True, f"SUBMITTED: {cand.alpha_id} ({meta.name})"
+    elif outcome.halt:
+        store.log_event("submit_halt", f"{cand.alpha_id}: {outcome.detail}\n{outcome.raw}")
+        store.mark_check(cand.expr, "UNSURE", f"{outcome.stage}: {outcome.detail}")
+        return False, f"UNSURE / TIMEOUT: {outcome.detail} (Check platform: https://platform.worldquantbrain.com/alpha/{cand.alpha_id})"
+    else:
+        store.mark_submit_rejected(cand.expr, f"{outcome.stage}: {outcome.detail}\n{outcome.raw}")
+        store.log_event("submit_rejected_raw", f"{cand.alpha_id}\n{outcome.raw}")
+        return False, f"REJECTED: {outcome.detail}"
+

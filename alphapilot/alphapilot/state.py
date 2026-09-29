@@ -104,6 +104,8 @@ class Alpha:
     check_detail: Optional[str]
     error: Optional[str]
     attempts: int
+    fields: Optional[str] = None
+    nfields: Optional[int] = None
 
 
 class Store:
@@ -435,7 +437,7 @@ class Store:
     _ALPHA_FIELDS = [f.name for f in __import__("dataclasses").fields(Alpha)]
 
     def _rows_to_alphas(self, rows):
-        return [Alpha(**{k: r[k] for k in self._ALPHA_FIELDS}) for r in rows]
+        return [Alpha(**{k: r[k] for k in self._ALPHA_FIELDS if k in r.keys()}) for r in rows]
 
     def submit_candidates(self, min_sharpe: float, min_fitness: float, limit: int, focus=None):
         base = (
@@ -454,6 +456,49 @@ class Store:
                 if r["expr"] not in seen and len(rows) < limit:
                     seen.add(r["expr"])
                     rows.append(r)
+        return self._rows_to_alphas(rows)
+
+    def candidate_counts_by_field(self, field_ids: list[str], min_sharpe: float = 0.0, min_fitness: float = 0.0) -> dict:
+        """Returns {field_name: {'total': count, 'unsure': count, 'pass': count}} for candidate review."""
+        base = (
+            "SELECT fields, nfields, check_result FROM alphas WHERE status='simulated' "
+            "AND (n_fail IS NULL OR n_fail=0) "
+            "AND (sharpe IS NULL OR sharpe >= ?) AND (fitness IS NULL OR fitness >= ?)"
+        )
+        keys = [*field_ids, "combo", "all"]
+        out = {k: {"total": 0, "unsure": 0, "pass": 0} for k in keys}
+        for r in self.conn.execute(base, (min_sharpe, min_fitness)):
+            chk = (r["check_result"] or "").upper()
+            is_unsure = 1 if ("UNSURE" in chk or "PENDING" in chk or "UNKNOWN" in chk) else 0
+            is_pass = 1 if chk == "PASS" else 0
+            out["all"]["total"] += 1
+            out["all"]["unsure"] += is_unsure
+            out["all"]["pass"] += is_pass
+
+            nf = r["nfields"] or 0
+            if nf == 1:
+                f = (r["fields"] or "").strip(",")
+                if f in out:
+                    out[f]["total"] += 1
+                    out[f]["unsure"] += is_unsure
+                    out[f]["pass"] += is_pass
+            elif nf >= 2:
+                out["combo"]["total"] += 1
+                out["combo"]["unsure"] += is_unsure
+                out["combo"]["pass"] += is_pass
+        return out
+
+    def get_candidates(self, min_sharpe: float = 0.0, min_fitness: float = 0.0, field: Optional[str] = None, limit: int = 100) -> list[Alpha]:
+        base = (
+            "SELECT * FROM alphas WHERE status='simulated' AND (n_fail IS NULL OR n_fail=0) "
+            "AND (sharpe IS NULL OR sharpe >= ?) AND (fitness IS NULL OR fitness >= ?)"
+        )
+        order = " ORDER BY fitness DESC NULLS LAST, sharpe DESC NULLS LAST LIMIT ?"
+        if not field or field == "all":
+            rows = self.conn.execute(base + order, (min_sharpe, min_fitness, limit)).fetchall()
+            return self._rows_to_alphas(rows)
+        clause, params = self._focus_clause(field)
+        rows = self.conn.execute(base + f" AND {clause}" + order, (min_sharpe, min_fitness, *params, limit)).fetchall()
         return self._rows_to_alphas(rows)
 
     def top(self, n: int = 10):

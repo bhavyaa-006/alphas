@@ -317,6 +317,90 @@ def cmd_submissions(args):
     store.close()
 
 
+def cmd_candidates(args):
+    home = _resolve_home(args)
+    cfg = C.load_config(home, getattr(args, "set", []))
+    db = _state_db_path(home, cfg.pack)
+    if not db.exists():
+        print(f"No progress yet for pack {cfg.pack!r}.")
+        return 0
+
+    store = ST.Store(db)
+    try:
+        pack = P.load_pack(cfg.pack, _pack_dirs(Path(__file__).resolve(), home))
+        field_ids = pack.field_ids()
+    except Exception as e:
+        print(f"Could not load pack {cfg.pack!r}: {e}")
+        store.close()
+        return 1
+
+    field = getattr(args, "field", None)
+    min_sharpe = getattr(args, "min_sharpe", None)
+    if min_sharpe is None:
+        min_sharpe = cfg.submit.min_sharpe
+    min_fitness = getattr(args, "min_fitness", None)
+    if min_fitness is None:
+        min_fitness = cfg.submit.min_fitness
+
+    if not field:
+        counts = store.candidate_counts_by_field(field_ids, min_sharpe, min_fitness)
+        names = [*field_ids, "combo"]
+        banner([
+            f"Candidate Alphas by Field · pack={pack.name}",
+            f"Eligible: sharpe >= {min_sharpe}  fitness >= {min_fitness}  (no failed IS test)",
+        ])
+        print(f"  {'':<4}{'field':<32}{'candidates':>10}{'unsure/pending':>16}{'passed check':>14}")
+        for i, name in enumerate(names, 1):
+            c = counts.get(name, {"total": 0, "unsure": 0, "pass": 0})
+            label = name if name != "combo" else "COMBOS (any mix of 2+ fields)"
+            print(f"  {i:>2}) {label:<32}{c['total']:>10}{c['unsure']:>16}{c['pass']:>14}")
+        tot = counts.get("all", {"total": 0, "unsure": 0, "pass": 0})
+        print(f"   0) {'All fields':<32}{tot['total']:>10}{tot['unsure']:>16}{tot['pass']:>14}")
+        print("\nTip: Run with --field <name> to list candidates, or open Candidate Review from `alphapilot menu`.")
+        store.close()
+        return 0
+
+    target_field = None if field in ("all", "0") else field
+    limit = getattr(args, "limit", 25) or 25
+    cands = store.get_candidates(min_sharpe, min_fitness, field=target_field, limit=limit)
+    if not cands:
+        print(f"No candidates found for field {field!r} (sharpe >= {min_sharpe}, fitness >= {min_fitness}).")
+        store.close()
+        return 0
+
+    do_check = getattr(args, "check", False)
+    do_submit = getattr(args, "submit", False)
+
+    if do_check or do_submit:
+        import ace_lib as ace
+        s = BC.ensure_session(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting... ({fmt_duration(r)} left)"))
+        BC.install_into(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting... ({fmt_duration(r)} left)"))
+
+        if do_check:
+            say(f"Checking {len(cands)} candidate(s) against BRAIN platform...")
+            for c in cands:
+                st, msg = E.check_candidate_platform(ace, s, c, store, cfg)
+                say(f"  {c.alpha_id}  sharpe={c.sharpe}  status={st}  ({msg})")
+            store.close()
+            return 0
+
+        if do_submit:
+            cand = cands[0]
+            say(f"Submitting top candidate {cand.alpha_id} (sharpe={cand.sharpe}, fitness={cand.fitness})...")
+            ok, msg = E.submit_candidate_now(ace, s, cfg, pack, store, cand)
+            say(f"Result: {msg}")
+            store.close()
+            return 0 if ok else 1
+
+    banner([f"Candidates in {field!r} ({len(cands)} shown, ordered by fitness/sharpe)"])
+    print(f"  {'#':<3}{'alpha_id':<14}{'sharpe':>7}{'fitness':>9}{'turnover':>10}{'check':>10}  expression")
+    for i, c in enumerate(cands, 1):
+        chk = c.check_result or "-"
+        print(f"  {i:>2}) {c.alpha_id or '-':<14}{c.sharpe or 0:>7.2f}{c.fitness or 0:>9.2f}{c.turnover or 0:>10.2f}{chk:>10}  {c.expr[:60]}")
+    store.close()
+    return 0
+
+
 def cmd_reset(args):
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
@@ -441,6 +525,17 @@ def build_parser():
     sp = sub.add_parser("submissions", help="list everything submitted so far")
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_submissions)
+
+    for cmd_alias in ("candidates", "review"):
+        sp = sub.add_parser(cmd_alias, help="review eligible candidates by field, check status, or submit")
+        sp.add_argument("--field", default=None, help="field name or 'combo' to list (default: summary of all fields)")
+        sp.add_argument("--limit", type=int, default=25, help="max candidates to display (default: 25)")
+        sp.add_argument("--check", action="store_true", help="re-check correlation and platform status on BRAIN")
+        sp.add_argument("--submit", action="store_true", help="submit the top passing candidate in this field")
+        sp.add_argument("--min-sharpe", type=float, default=None, dest="min_sharpe", help="override min Sharpe cutoff")
+        sp.add_argument("--min-fitness", type=float, default=None, dest="min_fitness", help="override min Fitness cutoff")
+        sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
+        sp.set_defaults(func=cmd_candidates)
 
     sp = sub.add_parser("jump", help="skip ahead in the pool (or --n 0 to un-skip and include everything again)")
     sp.add_argument("n", type=int, help="1-based alpha number to start from, e.g. 520; 0 = reset to the start")

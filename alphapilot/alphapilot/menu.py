@@ -202,6 +202,180 @@ def _retry_screen(home: Path):
     _pause()
 
 
+def _candidates_screen(home: Path):
+    """Interactive candidate review & submission by field."""
+    cfg = CFG.load_config(home)
+    db = C._state_db_path(home, cfg.pack)
+    if not db.exists():
+        print(f"No progress yet for pack {cfg.pack!r}.")
+        _pause()
+        return
+
+    store = ST.Store(db)
+    try:
+        pack, _pool, _ = C._ensure_pool(home, cfg, store)
+        field_ids = pack.field_ids()
+    except Exception as e:
+        print(f"\n!! could not load pack {cfg.pack!r}: {e}")
+        store.close()
+        _pause()
+        return
+
+    session_holder = {"s": None, "ace": None}
+
+    def get_session():
+        if session_holder["s"] is None:
+            import ace_lib as ace
+            say("Connecting session to BRAIN...")
+            s = C.BC.ensure_session(
+                ace, cfg, home,
+                on_persona_link=lambda u: say(f"Face check needed: {u}"),
+                on_waiting=lambda a, r: say(f"waiting... ({C.fmt_duration(r)} left)"),
+            )
+            C.BC.install_into(
+                ace, cfg, home,
+                on_persona_link=lambda u: say(f"Face check needed: {u}"),
+                on_waiting=lambda a, r: say(f"waiting... ({C.fmt_duration(r)} left)"),
+            )
+            session_holder["ace"] = ace
+            session_holder["s"] = s
+        return session_holder["ace"], session_holder["s"]
+
+    try:
+        while True:
+            min_sh = cfg.submit.min_sharpe
+            min_fit = cfg.submit.min_fitness
+            counts = store.candidate_counts_by_field(field_ids, min_sh, min_fit)
+            names = [*field_ids, "combo"]
+
+            banner([
+                f"Candidate Review · pack={pack.name}",
+                f"Eligible: sharpe >= {min_sh}  fitness >= {min_fit}  (no failed IS tests)",
+            ])
+            print(f"  {'':<4}{'field':<32}{'candidates':>10}{'unsure/pending':>16}{'passed check':>14}")
+            for i, name in enumerate(names, 1):
+                c = counts.get(name, {"total": 0, "unsure": 0, "pass": 0})
+                label = name if name != "combo" else "COMBOS (any mix of 2+ fields)"
+                print(f"  {i:>2}) {label:<32}{c['total']:>10}{c['unsure']:>16}{c['pass']:>14}")
+            tot = counts.get("all", {"total": 0, "unsure": 0, "pass": 0})
+            print(f"   0) {'All fields':<32}{tot['total']:>10}{tot['unsure']:>16}{tot['pass']:>14}")
+
+            print("\nEnter field number to inspect (or 0 for All, q to return):")
+            raw = input("> ").strip().lower()
+            if raw in ("q", "back", "exit", ""):
+                break
+            if raw == "0":
+                selected_field = None
+                field_label = "All fields"
+            elif raw.isdigit() and 1 <= int(raw) <= len(names):
+                selected_field = names[int(raw) - 1]
+                field_label = selected_field if selected_field != "combo" else "COMBOS"
+            else:
+                print("Invalid choice.")
+                continue
+
+            while True:
+                cands = store.get_candidates(min_sh, min_fit, field=selected_field, limit=30)
+                if not cands:
+                    print(f"\nNo eligible candidates in {field_label}.")
+                    _pause()
+                    break
+
+                banner([f"Candidates: {field_label} ({len(cands)} shown, sorted by fitness/sharpe)"])
+                print(f"  {'#':<3}{'alpha_id':<14}{'sharpe':>7}{'fitness':>9}{'turnover':>10}{'check':>10}  expression")
+                for i, c in enumerate(cands, 1):
+                    chk = c.check_result or "-"
+                    expr_snip = c.expr[:55] + ("..." if len(c.expr) > 55 else "")
+                    print(f"  {i:>2}) {c.alpha_id or '-':<14}{c.sharpe or 0:>7.2f}{c.fitness or 0:>9.2f}{c.turnover or 0:>10.2f}{chk:>10}  {expr_snip}")
+
+                print("\nOptions:")
+                print("  1-N) Inspect & submit candidate #")
+                print("    c) Check all unverified candidates on BRAIN platform")
+                print("    s) Submit top candidate in this list")
+                print("    0) Back to field list")
+
+                act = input("> ").strip().lower()
+                if act in ("0", "b", "back", "q", ""):
+                    break
+                elif act == "c":
+                    try:
+                        ace, s = get_session()
+                    except Exception as e:
+                        print(f"!! could not connect to BRAIN: {e}")
+                        _pause()
+                        continue
+                    say(f"Checking {len(cands)} candidate(s) on BRAIN platform...")
+                    for c in cands:
+                        st, msg = C.E.check_candidate_platform(ace, s, c, store, cfg)
+                        say(f"  {c.alpha_id}  sharpe={c.sharpe}  status={st}  ({msg})")
+                    _pause()
+                elif act == "s":
+                    top = cands[0]
+                    yn = input(f"Submit top candidate {top.alpha_id} (sharpe={top.sharpe}, fitness={top.fitness})? [y/N] ").strip().lower()
+                    if yn == "y":
+                        try:
+                            ace, s = get_session()
+                            say(f"Submitting {top.alpha_id}...")
+                            ok, msg = C.E.submit_candidate_now(ace, s, cfg, pack, store, top)
+                            say(f"Result: {msg}")
+                        except Exception as e:
+                            print(f"!! submission error: {e}")
+                        _pause()
+                elif act.isdigit() and 1 <= int(act) <= len(cands):
+                    cand = cands[int(act) - 1]
+                    while True:
+                        banner([f"Candidate Details · {cand.alpha_id}"])
+                        print(f"  alpha_id:     {cand.alpha_id}")
+                        print(f"  URL:          https://platform.worldquantbrain.com/alpha/{cand.alpha_id}")
+                        print(f"  fields:       {cand.fields or '-'}")
+                        print(f"  sharpe:       {cand.sharpe}    fitness:  {cand.fitness}    turnover: {cand.turnover}")
+                        print(f"  margin:       {cand.margin}    returns:  {cand.returns}")
+                        print(f"  check_result: {cand.check_result or 'not checked yet'}")
+                        if cand.check_detail:
+                            print(f"  check_detail: {cand.check_detail}")
+                        print(f"  expression:\n    {cand.expr}\n")
+
+                        sub_choice = _prompt_choice("Action", [
+                            ("Check platform status & correlation on BRAIN", "check"),
+                            ("Submit to BRAIN now", "submit"),
+                            ("Mark as check_fail (skip from candidates)", "fail"),
+                            ("Mark as submitted outside alphapilot", "manual_active"),
+                        ])
+                        if sub_choice is None:
+                            break
+                        if sub_choice == "check":
+                            try:
+                                ace, s = get_session()
+                                st, msg = C.E.check_candidate_platform(ace, s, cand, store, cfg)
+                                say(f"Result: status={st}  ({msg})")
+                            except Exception as e:
+                                print(f"!! error: {e}")
+                            _pause()
+                            break
+                        elif sub_choice == "submit":
+                            try:
+                                ace, s = get_session()
+                                ok, msg = C.E.submit_candidate_now(ace, s, cfg, pack, store, cand)
+                                say(f"Result: {msg}")
+                            except Exception as e:
+                                print(f"!! error: {e}")
+                            _pause()
+                            break
+                        elif sub_choice == "fail":
+                            reason = input("Reason for rejection: ").strip() or "manually skipped"
+                            store.mark_check(cand.expr, "FAIL", reason)
+                            print(f"Marked {cand.alpha_id} as check_fail.")
+                            _pause()
+                            break
+                        elif sub_choice == "manual_active":
+                            store.mark_submitted(cand.expr, cand.alpha_id, "(manual active)", "", "manual", cfg.submit.timezone)
+                            print(f"Marked {cand.alpha_id} as submitted.")
+                            _pause()
+                            break
+    finally:
+        store.close()
+
+
 def _submissions_screen(home: Path):
     C.cmd_submissions(_args(home))
     _pause()
@@ -341,6 +515,7 @@ def main_menu(home_arg=None):
         choice = _prompt_choice("Main menu", [
             ("Quick setup (init + login + doctor)", "setup"),
             ("Run (simulate / submit - resumable)", "run"),
+            ("Candidates (review & submit eligible alphas by field)", "candidates"),
             ("Status", "status"),
             ("Fields (per-field progress)", "fields"),
             ("View errors", "errors"),
@@ -358,6 +533,8 @@ def main_menu(home_arg=None):
                 _quick_setup(home)
             elif choice == "run":
                 _run_screen(home)
+            elif choice == "candidates":
+                _candidates_screen(home)
             elif choice == "status":
                 _status_screen(home)
             elif choice == "fields":

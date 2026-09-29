@@ -61,6 +61,7 @@ def default_config() -> dict:
             "min_fitness": 0.0,
             "poll_seconds": 10,
             "timeout_min": 15,
+            "halt_on_unsure": False,       # False = warn, skip to next candidate, keep batch running; True = halt run
         },
         "llm": {
             "provider": "template",       # openrouter | mistral | openai | ollama | custom | template
@@ -202,6 +203,8 @@ def validate(c: dict) -> list:
     num("submit.min_fitness")
     num("submit.poll_seconds", 0)
     num("submit.timeout_min", 0)
+    if not isinstance(c["submit"].get("halt_on_unsure", False), bool):
+        bad.append("submit.halt_on_unsure must be a boolean (true or false)")
     focus = (c.get("run") or {}).get("focus", [])
     if not isinstance(focus, list) or not all(isinstance(x, str) for x in focus):
         bad.append("run.focus must be a list of strings, e.g. [oth176_eq_medium, combo]")
