@@ -38,11 +38,16 @@ GENIUS_OPERATORS list[str]  operators that need the Genius tier; if the
 """
 from __future__ import annotations
 
-import importlib.util
+import ast
+import difflib
+import hashlib
+import os
 import re
 import sys
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 OP_RE = re.compile(r"\b([a-z_][a-z0-9_]*)\s*\(")
 
@@ -66,6 +71,8 @@ class Pack:
     build_pool_fn: object
     source_path: Path
     module: object = field(repr=False)
+    key: str = ""          # file stem - the unique identity of this pack (PACK_NAME may be duplicated)
+    file_hash: str = ""    # sha256 of the pack file's bytes - changes whenever the file is replaced/edited
 
     def build(self, seed: int, pool_size: int) -> dict:
         pool = self.build_pool_fn(seed=seed, pool_size=pool_size)
@@ -83,28 +90,127 @@ REQUIRED_SETTINGS_KEYS = {
 }
 
 
-def _resolve_path(name_or_path: str, search_dirs) -> Path:
-    p = Path(name_or_path)
-    if p.suffix == ".py" and p.exists():
-        return p.resolve()
+@dataclass
+class PackInfo:
+    """One pack file on disk. `key` (the file stem) is the pack's identity: unique per folder, and it is
+    what config.yaml and the state database are keyed on. `pack_name` is only a display label and CAN be
+    duplicated by two files (e.g. a re-downloaded `foo-1.py` next to `foo.py`) - that is detected, not trusted."""
+
+    key: str
+    path: Path
+    pack_name: Optional[str]
+    file_hash: str
+    shadowed_by: Optional[Path] = None          # an earlier folder has a file with the same stem
+    same_name_as: list = field(default_factory=list)   # keys of other packs declaring the same PACK_NAME
+    description: Optional[str] = None
+    error: Optional[str] = None
+
+    @property
+    def label(self) -> str:
+        return self.pack_name or self.key
+
+
+def _file_hash(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _static_pack_name(path: Path) -> Optional[str]:
+    """Reads PACK_NAME from the file's AST without executing it (cheap, side-effect free)."""
+    try:
+        tree = ast.parse(Path(path).read_bytes())
+    except (SyntaxError, ValueError, OSError):
+        return None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "PACK_NAME" for t in node.targets):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                return node.value.value
+    return None
+
+
+def _info_for(path: Path) -> PackInfo:
+    path = Path(path).resolve()
+    return PackInfo(key=path.stem, path=path, pack_name=_static_pack_name(path), file_hash=_file_hash(path))
+
+
+def discover(search_dirs) -> list:
+    """Every *.py pack file in the search folders (earlier folder wins on the same file stem; the loser is
+    kept in the list with `shadowed_by` set so it can be reported instead of silently ignored)."""
+    infos, first_by_key = [], {}
     for d in search_dirs:
-        cand = Path(d) / f"{name_or_path}.py"
-        if cand.exists():
-            return cand.resolve()
-    tried = ", ".join(str(Path(d) / f"{name_or_path}.py") for d in search_dirs)
-    raise PackError(f"pack {name_or_path!r} not found. Tried: {tried}\nRun `alphapilot packs` to list available packs.")
+        d = Path(d)
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.py")):
+            if f.stem.startswith("_"):
+                continue
+            info = _info_for(f)
+            if info.key in first_by_key:
+                info.shadowed_by = first_by_key[info.key].path
+            else:
+                first_by_key[info.key] = info
+            infos.append(info)
+    live = [i for i in infos if not i.shadowed_by]
+    for i in live:
+        i.same_name_as = [o.key for o in live if o is not i and o.pack_name and o.pack_name == i.pack_name]
+    return infos
+
+
+def resolve_pack(name_or_path: str, search_dirs) -> PackInfo:
+    """Turns whatever is in config.yaml (file stem, PACK_NAME, or a path to a .py) into exactly ONE pack
+    file. A file stem always wins; a PACK_NAME shared by several files is refused as ambiguous."""
+    ref = str(name_or_path).strip()
+    if ref.endswith(".py") or os.sep in ref or "/" in ref:
+        p = Path(ref).expanduser()
+        if p.is_file():
+            return _info_for(p)
+        raise PackError(f"pack file not found: {ref}")
+    live = [i for i in discover(search_dirs) if not i.shadowed_by]
+    for exact in (lambda i: i.key == ref, lambda i: i.pack_name == ref,
+                  lambda i: i.key.lower() == ref.lower(), lambda i: (i.pack_name or "").lower() == ref.lower()):
+        hits = [i for i in live if exact(i)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise PackError(
+                f"pack name {ref!r} is ambiguous - {len(hits)} files declare it:\n  "
+                + "\n  ".join(f"{h.key}  ({h.path})" for h in hits)
+                + "\nSet `pack:` to the exact FILE name (without .py) of the one you want, "
+                  "or delete/rename the extra file(s)."
+            )
+    names = sorted({x for i in live for x in (i.key, i.pack_name) if x})
+    close = difflib.get_close_matches(ref, names, n=3, cutoff=0.5)
+    tried = ", ".join(str(Path(d)) for d in search_dirs)
+    hint = f"\nDid you mean: {', '.join(close)}?" if close else ""
+    raise PackError(f"pack {ref!r} not found in: {tried}{hint}\nRun `alphapilot packs` to list available packs.")
+
+
+def _exec_pack_file(path: Path):
+    """Runs the pack file from its CURRENT bytes. Deliberately bypasses Python's import machinery: its
+    __pycache__ check trusts source mtime+size, so a replaced file with the same size/mtime (copy over,
+    unzip, re-download) silently ran the OLD compiled code. Nothing here reads or writes .pyc files."""
+    data = Path(path).read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    safe = re.sub(r"\W", "_", Path(path).stem)
+    prefix = f"alphapilot_pack_{safe}_"
+    mod_name = prefix + digest[:12]
+    for stale in [m for m in sys.modules if m.startswith(prefix) and m != mod_name]:
+        del sys.modules[stale]
+    module = types.ModuleType(mod_name)
+    module.__file__ = str(path)
+    sys.modules[mod_name] = module
+    try:
+        exec(compile(data, str(path), "exec", dont_inherit=True), module.__dict__)
+    except BaseException:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module, digest
 
 
 def load_pack(name_or_path: str, search_dirs) -> Pack:
-    path = _resolve_path(name_or_path, search_dirs)
-    mod_name = f"alphapilot_pack_{path.stem}"
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise PackError(f"could not load pack file: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
+    info = resolve_pack(name_or_path, search_dirs)
+    path = info.path
     try:
-        spec.loader.exec_module(module)
+        module, file_hash = _exec_pack_file(path)
     except Exception as e:
         raise PackError(f"pack {path} raised an error while loading: {e!r}") from e
 
@@ -143,6 +249,8 @@ def load_pack(name_or_path: str, search_dirs) -> Pack:
         build_pool_fn=build_fn,
         source_path=path,
         module=module,
+        key=info.key,
+        file_hash=file_hash,
     )
 
     # smoke-test build_pool with a tiny pool so a broken pack fails at `run`
@@ -244,20 +352,19 @@ def validate_focus(focus, field_ids) -> list:
     return bad
 
 
-def list_packs(search_dirs):
-    out = []
-    seen = set()
-    for d in search_dirs:
-        d = Path(d)
-        if not d.is_dir():
+def list_pack_infos(search_dirs) -> list:
+    """discover() + a real load of each live pack (description / load error filled in)."""
+    infos = discover(search_dirs)
+    for i in infos:
+        if i.shadowed_by:
             continue
-        for f in sorted(d.glob("*.py")):
-            if f.stem in seen or f.stem.startswith("_"):
-                continue
-            seen.add(f.stem)
-            try:
-                p = load_pack(f.stem, search_dirs)
-                out.append((p.name, p.description, str(f), None))
-            except PackError as e:
-                out.append((f.stem, "(failed to load)", str(f), str(e)))
-    return out
+        try:
+            p = load_pack(str(i.path), search_dirs)
+            i.description = p.description
+            i.pack_name = p.name
+        except PackError as e:
+            i.error = str(e)
+    for i in infos:  # PACK_NAME may only now be known for packs whose name is not a plain literal
+        if not i.shadowed_by:
+            i.same_name_as = [o.key for o in infos if o is not i and not o.shadowed_by and o.pack_name and o.pack_name == i.pack_name]
+    return infos

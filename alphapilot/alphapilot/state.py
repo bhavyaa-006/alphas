@@ -216,29 +216,64 @@ class Store:
 
     # ---------------------------------------------------------------- pool
 
-    def init_pool(self, pack_name: str, pack_hash: str, seed: int, pool_size: int, pool: dict) -> dict:
+    # statuses that carry no result worth keeping - safe to drop when the pool they came from is gone
+    _DISPOSABLE = ("pending", "simulating", "skipped", "error")
+
+    def archive_to(self, dest: Path) -> Path:
+        """Consistent copy of this whole database (SQLite online-backup API, WAL-safe)."""
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        out = sqlite3.connect(str(dest))
+        try:
+            self.conn.backup(out)
+        finally:
+            out.close()
+        return dest
+
+    def init_pool(self, pack_name: str, pack_hash: str, seed: int, pool_size: int, pool: dict,
+                  file_hash: str = "", pack_key: str = "") -> dict:
         """
-        Registers a (pack, seed, pool_size) run. If a run already exists with
-        a DIFFERENT pack/seed/pool_size, raises StateError instead of quietly
-        mixing two pools in one state.db - use a different --home / state file
-        for a different pool. Returns {"new": n, "existing": n}.
+        Makes this state.db match the pack as it is on disk RIGHT NOW. Never mixes two different packs:
+
+        * first run                    -> just register the pool.
+        * nothing changed              -> only add missing rows (idempotent, as before).
+        * pack FILE or seed/pool_size changed (same fields/settings/operators)
+                                       -> reconcile: unstarted rows that are no longer in the pool are
+                                          DELETED (they came from the old file), rows that already have a
+                                          result are kept, positions/families/field tags are refreshed and
+                                          any `jump` skip is cleared (positions moved).
+        * fields/settings/operators changed (a different dataset or different simulation settings)
+                                       -> old results are not comparable: the whole database is archived to
+                                          <state>/archive/ and a clean pool is started. Submitted alphas
+                                          stay recorded so they are never re-simulated or re-submitted.
+
+        Returns {"new", "existing", "removed", "action": fresh|unchanged|reconciled|reset, "archive": path|None}.
         """
-        existing_pack = self.get_meta("pack_name")
-        if existing_pack is not None:
-            mismatches = []
-            for key, val in [("pack_name", pack_name), ("pack_hash", pack_hash), ("seed", str(seed)), ("pool_size", str(pool_size))]:
-                if self.get_meta(key) != str(val):
-                    mismatches.append(f"{key}: stored={self.get_meta(key)!r} now={val!r}")
-            if mismatches:
-                raise StateError(
-                    "This state directory already has a DIFFERENT pool recorded:\n  "
-                    + "\n  ".join(mismatches)
-                    + "\nUse a different --home directory for a new pool, or `alphapilot reset` to discard this one."
-                )
+        info = {"removed": 0, "action": "fresh", "archive": None}
+        stored_name = self.get_meta("pack_name")
+        if stored_name is not None:
+            stored_compat = self.get_meta("pack_hash")
+            stored_file = self.get_meta("pack_file_hash")
+            if stored_compat != pack_hash:
+                stamp = utcnow_iso().replace(":", "").replace("-", "")
+                info["archive"] = str(self.archive_to(self.path.parent / "archive" / f"{self.path.stem}-{stamp}.db"))
+                with self._tx():
+                    # keep submitted alphas (terminal) so they can't be re-run / re-submitted; drop the rest
+                    self.conn.execute("DELETE FROM alphas WHERE status != 'submitted'")
+                    self.conn.execute("UPDATE alphas SET fields=NULL, nfields=NULL, idx=NULL")
+                    self.conn.execute("DELETE FROM meta WHERE key IN ('pack_name','pack_hash','pack_file_hash','pack_key','seed','pool_size')")
+                self.log_event("pool_reset", f"fields/settings/operators changed; archived to {info['archive']}")
+                info["action"] = "reset"
+            elif (stored_file != file_hash or self.get_meta("seed") != str(seed)
+                  or self.get_meta("pool_size") != str(pool_size)):
+                info["action"] = "reconciled"
+            else:
+                info["action"] = "unchanged"
 
         with self._tx():
             self.conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
-            for k, v in [("pack_name", pack_name), ("pack_hash", pack_hash), ("seed", seed), ("pool_size", pool_size)]:
+            for k, v in [("pack_name", pack_name), ("pack_key", pack_key), ("pack_hash", pack_hash),
+                         ("pack_file_hash", file_hash), ("seed", seed), ("pool_size", pool_size)]:
                 self.conn.execute(
                     "INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (k, str(v)),
@@ -247,6 +282,28 @@ class Store:
                 "INSERT INTO meta(key, value) VALUES ('created_at', ?) ON CONFLICT(key) DO NOTHING",
                 (utcnow_iso(),),
             )
+            if info["action"] in ("reconciled", "reset"):
+                self.conn.execute("CREATE TEMP TABLE IF NOT EXISTS cur_pool(expr TEXT PRIMARY KEY, idx INTEGER, family TEXT)")
+                self.conn.execute("DELETE FROM cur_pool")
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO cur_pool(expr, idx, family) VALUES (?, ?, ?)",
+                    [(e, i, fam) for i, (e, fam) in enumerate(pool.items())],
+                )
+                marks = ",".join("?" * len(self._DISPOSABLE))
+                cur = self.conn.execute(
+                    f"DELETE FROM alphas WHERE status IN ({marks}) AND expr NOT IN (SELECT expr FROM cur_pool)",
+                    self._DISPOSABLE,
+                )
+                info["removed"] = cur.rowcount
+                # a `jump` skip refers to positions in the OLD ordering - it no longer means anything
+                self.conn.execute("UPDATE alphas SET status='pending' WHERE status='skipped'")
+                # rows that stay get their new position/family; kept-but-no-longer-in-pool results get idx NULL
+                self.conn.execute(
+                    "UPDATE alphas SET idx=(SELECT idx FROM cur_pool c WHERE c.expr=alphas.expr), "
+                    "family=COALESCE((SELECT family FROM cur_pool c WHERE c.expr=alphas.expr), family)"
+                )
+                self.conn.execute("UPDATE alphas SET fields=NULL, nfields=NULL")   # re-tagged by tag_fields()
+                self.conn.execute("DROP TABLE cur_pool")
             n_new = 0
             for i, (expr, family) in enumerate(pool.items()):
                 cur = self.conn.execute(
@@ -255,7 +312,10 @@ class Store:
                     (expr, i, family, utcnow_iso(), utcnow_iso()),
                 )
                 n_new += cur.rowcount
-        return {"new": n_new, "existing": len(pool) - n_new}
+        if info["action"] == "reconciled":
+            self.log_event("pool_reconciled", f"pack file/seed/pool_size changed; removed {info['removed']} stale unstarted row(s)")
+        info.update({"new": n_new, "existing": len(pool) - n_new})
+        return info
 
     def pool_size(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) n FROM alphas").fetchone()

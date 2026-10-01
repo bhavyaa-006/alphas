@@ -51,7 +51,7 @@ def _quick_setup(home: Path):
 
 def _pick_focus(home: Path, cfg):
     """Returns (focus_list, cancelled). Empty list = no filter (whole pool)."""
-    store = ST.Store(C._state_db_path(home, cfg.pack))
+    store = ST.Store(C._state_db_for(home, cfg))
     try:
         pack, _pool, _ = C._ensure_pool(home, cfg, store)
         counts = store.focus_counts(pack.field_ids())
@@ -134,7 +134,7 @@ def _status_screen(home: Path):
 
 
 def _errors_screen(home: Path):
-    store = ST.Store(C._state_db_path(home, CFG.load_config(home).pack))
+    store = ST.Store(C._state_db_for(home, CFG.load_config(home)))
     summary = store.error_summary(15)
     store.close()
     banner(["Error breakdown (grouped by message)"])
@@ -155,7 +155,7 @@ def _errors_screen(home: Path):
 def _retry_screen(home: Path):
     """Interactively reset errored expressions back to pending."""
     cfg = CFG.load_config(home)
-    db = C._state_db_path(home, cfg.pack)
+    db = C._state_db_for(home, cfg)
     if not db.exists():
         print(f"No progress yet for pack {cfg.pack!r}.")
         _pause()
@@ -205,7 +205,7 @@ def _retry_screen(home: Path):
 def _candidates_screen(home: Path):
     """Interactive candidate review & submission by field."""
     cfg = CFG.load_config(home)
-    db = C._state_db_path(home, cfg.pack)
+    db = C._state_db_for(home, cfg)
     if not db.exists():
         print(f"No progress yet for pack {cfg.pack!r}.")
         _pause()
@@ -404,14 +404,24 @@ def _settings_screen(home: Path):
             return
         data = dict(cfg)
         if choice == "pack":
-            found = PA.list_packs(C._pack_dirs(Path(C.__file__).resolve(), home))
+            dirs = C._pack_dirs(Path(C.__file__).resolve(), home)
+            try:
+                active_key = PA.resolve_pack(cfg.pack, dirs).key
+            except PA.PackError:
+                active_key = None
+            found = PA.list_pack_infos(dirs)
             options = []
-            for name, desc, path, err in found:
-                if err:
+            for i in found:
+                if i.shadowed_by:
+                    print(f"  (ignoring {i.path}: an earlier folder already has a pack with that file name)")
                     continue
-                db = C._state_db_path(home, name)
-                tag = " (active)" if name == cfg.pack else (" [has progress]" if db.exists() else "")
-                options.append((f"{name}{tag} - {desc}", name))
+                if i.error:
+                    print(f"  (skipping {i.key}: failed to load - {i.error.splitlines()[0]})")
+                    continue
+                db = C._state_db_path(home, i.key)
+                tag = " (active)" if i.key == active_key else (" [has progress]" if db.exists() else "")
+                dup = f"  !! same PACK_NAME as {', '.join(i.same_name_as)}" if i.same_name_as else ""
+                options.append((f"{i.key}{tag} - {i.description}{dup}", i.key))
             if not options:
                 print("\nNo packs found. Drop a pack .py file in packs/ (or data/packs/) and try again.")
                 _pause()
@@ -467,7 +477,7 @@ def _reset_screen(home: Path):
 
 def _jump_screen(home: Path):
     cfg = CFG.load_config(home)
-    db = C._state_db_path(home, cfg.pack)
+    db = C._state_db_for(home, cfg)
     total = None
     if db.exists():
         store = ST.Store(db)
@@ -501,8 +511,12 @@ def main_menu(home_arg=None):
         else:
             try:
                 cfg = CFG.load_config(home)
-                db = C._state_db_path(home, cfg.pack)
-                print(f"active pack: {cfg.pack}")
+                db = C._state_db_for(home, cfg)
+                try:
+                    _info = PA.resolve_pack(cfg.pack, C._pack_dirs(Path(C.__file__).resolve(), home))
+                    print(f"active pack: {_info.key}   ({_info.path})")
+                except PA.PackError as _e:
+                    print(f"active pack: {cfg.pack}   !! {str(_e).splitlines()[0]}")
                 if db.exists():
                     store = ST.Store(db)
                     print(f"progress: {store.counts()}")

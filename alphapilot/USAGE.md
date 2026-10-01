@@ -227,6 +227,19 @@ alphapilot packs                              # lists it
 alphapilot run --set pack=your_new_pack_name  # runs it
 ```
 
+
+**How packs are identified (important if you replace or duplicate files):** a pack
+is identified by its **file name** (`packs/foo.py` → `foo`), not by `PACK_NAME`
+inside it. `pack:` in config accepts the file name (preferred) or a `PACK_NAME`;
+if two files declare the same `PACK_NAME` and you pick by name, alphapilot refuses
+and tells you which files clash. Only the pack that resolves from config is marked
+active. Packs are always read from the file's current contents (no stale
+`__pycache__`). When you replace/edit a pack file, the next run reconciles its
+progress automatically: not-yet-simulated expressions from the old file are
+removed, simulated/submitted results are kept. If the fields, settings or
+operators changed, the old progress is archived to `data/state/archive/` and a
+clean pool starts (submitted alphas are remembered).
+
 or pick it from the menu's **Settings → Change pack**, which shows a
 numbered list and marks which one is currently active. Each pack keeps its
 own separate progress file (`data/state/<pack>.db`), so switching back and

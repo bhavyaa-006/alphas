@@ -21,13 +21,39 @@ def _pack_dirs(here: Path, home: Path):
     return [home / "packs", repo_root / "packs"]
 
 
-def _state_db_path(home: Path, pack_name: str) -> Path:
-    """Each pack gets its own state.db under <home>/state/, so switching packs
-    (or trying several) never collides with another pack's progress."""
+def _state_db_path(home: Path, pack_key: str) -> Path:
+    """Each pack gets its own state.db under <home>/state/, keyed on the pack FILE name (stem), so two
+    files that happen to declare the same PACK_NAME can never share (and corrupt) one progress file."""
     d = home / "state"
     d.mkdir(parents=True, exist_ok=True)
-    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in pack_name)
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in pack_key)
     return d / f"{safe}.db"
+
+
+def _resolve_info(home: Path, cfg) -> P.PackInfo:
+    return P.resolve_pack(cfg.pack, _pack_dirs(Path(__file__).resolve(), home))
+
+
+def _state_db_for(home: Path, cfg) -> Path:
+    """State db for the pack named in config. Older versions keyed the db on PACK_NAME; if this pack has
+    no db yet but exactly one legacy one exists for its PACK_NAME (and no other pack file could own it),
+    it is adopted instead of being orphaned. Reconciliation against the real file happens in init_pool."""
+    try:
+        info = _resolve_info(home, cfg)
+    except P.PackError:
+        return _state_db_path(home, str(cfg.pack))
+    path = _state_db_path(home, info.key)
+    if not path.exists() and info.pack_name and info.pack_name != info.key and not info.same_name_as:
+        legacy = _state_db_path(home, info.pack_name)
+        other_owner = any(i.key == info.pack_name and not i.shadowed_by
+                          for i in P.discover(_pack_dirs(Path(__file__).resolve(), home)))
+        if legacy.exists() and not other_owner:
+            for suffix in ("", "-wal", "-shm"):
+                src_p = Path(str(legacy) + suffix)
+                if src_p.exists():
+                    src_p.rename(Path(str(path) + suffix))
+            say(f"(adopted existing progress {legacy.name} -> {path.name}; it will be checked against the pack file)")
+    return path
 
 
 def _load_pack_and_pool(home: Path, cfg):
@@ -37,13 +63,22 @@ def _load_pack_and_pool(home: Path, cfg):
 
 
 def _ensure_pool(home: Path, cfg, store: ST.Store):
-    """Builds the pool from the pack and registers it in `store` (idempotent -
-    safe to call every time; only inserts rows that don't exist yet)."""
+    """Builds the pool from the pack file AS IT IS ON DISK NOW and makes `store` match it (idempotent).
+    A replaced/edited pack file triggers a reconcile (stale unstarted rows removed); a different
+    dataset/settings archives the old progress and starts clean - see Store.init_pool."""
     from .util import sha256_json
 
     pack, pool = _load_pack_and_pool(home, cfg)
     pack_hash = sha256_json({"fields": pack.fields, "settings": pack.settings, "ops": sorted(pack.allowed_operators)})
-    r = store.init_pool(pack.name, pack_hash, cfg.simulation.seed, cfg.simulation.pool_size, pool)
+    r = store.init_pool(pack.name, pack_hash, cfg.simulation.seed, cfg.simulation.pool_size, pool,
+                        file_hash=pack.file_hash, pack_key=pack.key)
+    if r["action"] == "reconciled":
+        say(f"pack file {pack.source_path.name} changed since last time - removed {r['removed']} stale "
+            f"not-yet-simulated expression(s); kept every simulated/submitted result.")
+    elif r["action"] == "reset":
+        say(f"pack {pack.key!r}: fields/settings/operators changed, so old results are not comparable. "
+            f"Old progress archived to {r['archive']} and a clean pool started "
+            f"(submitted alphas are remembered).")
     store.tag_fields(pack.field_ids())
     return pack, pool, r
 
@@ -70,12 +105,26 @@ def cmd_login(args):
 
 def cmd_packs(args):
     home = _resolve_home(args)
-    here = Path(__file__).resolve()
-    for name, desc, path, err in P.list_packs(_pack_dirs(here, home)):
-        if err:
-            print(f"  !! {name:<20} FAILED TO LOAD: {err.splitlines()[0]}")
+    cfg = C.load_config(home, getattr(args, "set", []))
+    dirs = _pack_dirs(Path(__file__).resolve(), home)
+    try:
+        active = _resolve_info(home, cfg).key
+    except P.PackError:
+        active = None
+    infos = P.list_pack_infos(dirs)
+    for i in infos:
+        if i.shadowed_by:
+            print(f"  -- {i.key:<24} IGNORED (same file name exists in an earlier folder, which wins)\n      ({i.path})")
+        elif i.error:
+            print(f"  !! {i.key:<24} FAILED TO LOAD: {i.error.splitlines()[0]}\n      ({i.path})")
         else:
-            print(f"  {name:<20} {desc}\n      ({path})")
+            mark = "*" if i.key == active else " "
+            print(f" {mark} {i.key:<24} {i.description}\n      ({i.path})")
+            if i.same_name_as:
+                print(f"      !! PACK_NAME {i.pack_name!r} is ALSO declared by: {', '.join(i.same_name_as)} "
+                      f"- select by file name ({i.key}) and delete the extra file you don't want")
+    print(f"\n  * = active pack (config.yaml -> pack: {cfg.pack!r}"
+          + ("" if active else " - NOT FOUND, run Settings -> Change pack") + ")")
 
 
 def cmd_doctor(args):
@@ -163,7 +212,7 @@ def cmd_run(args):
     setup_logging(home / "alphapilot.log", cfg.logging.verbose)
     SEC.ensure_credentials(home)
 
-    store = ST.Store(_state_db_path(home, cfg.pack))
+    store = ST.Store(_state_db_for(home, cfg))
     try:
         pack, pool, r = _ensure_pool(home, cfg, store)
     except ST.StateError as e:
@@ -265,7 +314,7 @@ def cmd_fields(args):
     """Per-field progress, so you can decide what to focus on."""
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
-    store = ST.Store(_state_db_path(home, cfg.pack))
+    store = ST.Store(_state_db_for(home, cfg))
     try:
         pack, pool, _ = _ensure_pool(home, cfg, store)
         counts = store.focus_counts(pack.field_ids())
@@ -283,7 +332,7 @@ def cmd_fields(args):
 def cmd_status(args):
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
-    db = _state_db_path(home, cfg.pack)
+    db = _state_db_for(home, cfg)
     if not db.exists():
         print(f"No progress yet for pack {cfg.pack!r} (nothing run there so far).")
         return 0
@@ -304,7 +353,7 @@ def cmd_status(args):
 def cmd_submissions(args):
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
-    db = _state_db_path(home, cfg.pack)
+    db = _state_db_for(home, cfg)
     if not db.exists():
         print(f"No progress yet for pack {cfg.pack!r}.")
         return 0
@@ -320,7 +369,7 @@ def cmd_submissions(args):
 def cmd_candidates(args):
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
-    db = _state_db_path(home, cfg.pack)
+    db = _state_db_for(home, cfg)
     if not db.exists():
         print(f"No progress yet for pack {cfg.pack!r}.")
         return 0
@@ -404,7 +453,7 @@ def cmd_candidates(args):
 def cmd_reset(args):
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
-    db = _state_db_path(home, cfg.pack)
+    db = _state_db_for(home, cfg)
     if not args.yes:
         if input(f"Delete {db}? This forgets all simulation/submission progress for pack {cfg.pack!r} "
                  f"(does NOT touch anything already submitted to BRAIN). [y/N] ").strip().lower() != "y":
@@ -421,7 +470,7 @@ def cmd_retry(args):
     """Reset errored expressions back to pending so they are picked up on the next `run`."""
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
-    db = _state_db_path(home, cfg.pack)
+    db = _state_db_for(home, cfg)
     if not db.exists():
         print(f"No progress yet for pack {cfg.pack!r} (nothing run there so far).")
         return 0
@@ -458,7 +507,7 @@ def cmd_menu(args):
 def cmd_jump(args):
     home = _resolve_home(args)
     cfg = C.load_config(home, args.set)
-    db = _state_db_path(home, cfg.pack)
+    db = _state_db_for(home, cfg)
     store = ST.Store(db)
     try:
         pack, pool, r = _ensure_pool(home, cfg, store)
@@ -499,6 +548,7 @@ def build_parser():
     sp.set_defaults(func=cmd_login)
 
     sp = sub.add_parser("packs", help="list available dataset packs")
+    sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_packs)
 
     sp = sub.add_parser("doctor", help="verify session, fields, operators, LLM, and run one smoke-test simulation")
