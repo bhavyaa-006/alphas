@@ -418,7 +418,7 @@ def run_submission_cycle(ace, s, cfg, pack, store: Store, ask_fn: Optional[Calla
             say(f"       alpha is NOT rejected - you can submit it by hand: https://platform.worldquantbrain.com/alpha/{cand.alpha_id}")
             continue
 
-        outcome = BC.submit_alpha(ace, s, cand.alpha_id, timeout_s=cfg.submit.timeout_min * 60, poll_every_s=cfg.submit.poll_seconds)
+        outcome = BC.submit_alpha(ace, s, cand.alpha_id, timeout_s=cfg.submit.timeout_min * 60, poll_every_s=cfg.submit.poll_seconds, show_polling=cfg.submit.show_polling)
         if outcome.ok:
             store.mark_submitted(cand.expr, cand.alpha_id, meta.name, meta.category, meta.source, cfg.submit.timezone)
             submitted_this_run += 1
@@ -515,7 +515,7 @@ def submit_candidate_now(ace, s, cfg, pack, store: Store, cand: Alpha) -> tuple[
     if resp.status_code // 100 != 2:
         return False, f"Could not save properties (HTTP {resp.status_code}): {resp.text[:300]}"
 
-    outcome = BC.submit_alpha(ace, s, cand.alpha_id, timeout_s=cfg.submit.timeout_min * 60, poll_every_s=cfg.submit.poll_seconds)
+    outcome = BC.submit_alpha(ace, s, cand.alpha_id, timeout_s=cfg.submit.timeout_min * 60, poll_every_s=cfg.submit.poll_seconds, show_polling=cfg.submit.show_polling)
     if outcome.ok:
         store.mark_submitted(cand.expr, cand.alpha_id, meta.name, meta.category, meta.source, cfg.submit.timezone)
         store.log_event("submitted", cand.alpha_id)

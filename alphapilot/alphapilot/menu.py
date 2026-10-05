@@ -387,7 +387,8 @@ def _settings_screen(home: Path):
         print(f"\npack={cfg.pack}")
         print(f"simulation: pool_size={cfg.simulation.pool_size}  batch_size={cfg.simulation.batch_size}  "
               f"error_streak_halt={cfg.simulation.error_streak_halt}")
-        print(f"submit: mode={cfg.submit.mode}  max_per_day={cfg.submit.max_per_day}  max_per_run={cfg.submit.max_per_run}")
+        print(f"submit: mode={cfg.submit.mode}  max_per_day={cfg.submit.max_per_day}  max_per_run={cfg.submit.max_per_run}  "
+              f"show_polling={cfg.submit.show_polling}")
         print(f"saved focus: {cfg['run'].get('focus') or '(none - whole pool)'}")
         print(f"llm: provider={cfg.llm.provider}  model={cfg.llm.model or '(default)'}  fallback={cfg.llm.fallback}")
         choice = _prompt_choice("Settings", [
@@ -395,6 +396,7 @@ def _settings_screen(home: Path):
             ("Change submit.mode", "submit_mode"),
             ("Change submit.max_per_day", "max_per_day"),
             ("Change submit.max_per_run (stop run after N submissions, 0 = no limit)", "max_per_run"),
+            ("Toggle submit polling output", "show_polling"),
             ("Change saved field focus (used when you press Enter in the Run screen)", "focus"),
             ("Change llm.provider", "llm_provider"),
             ("Edit config.yaml directly (opens the path)", "edit"),
@@ -443,6 +445,9 @@ def _settings_screen(home: Path):
             val = input("submit.max_per_run (integer, 0 = no limit): ").strip()
             if val.isdigit():
                 data["submit"]["max_per_run"] = int(val)
+        elif choice == "show_polling":
+            data["submit"]["show_polling"] = not bool(data["submit"].get("show_polling", True))
+            print(f"\nsubmit.show_polling = {data['submit']['show_polling']}")
         elif choice == "focus":
             val = input("focus, comma-separated in order (field ids, combo, combo:<field>; blank = none): ").strip()
             data.setdefault("run", {})["focus"] = PA.normalize_focus(val)

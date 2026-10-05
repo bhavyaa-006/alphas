@@ -253,7 +253,7 @@ def check_rate_limit_headers(resp) -> Optional[dict]:
 
 # ---------------------------------------------------------------- submit
 
-def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 10, ignore_names=()) -> SubmitOutcome:
+def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 10, ignore_names=(), show_polling: bool = False) -> SubmitOutcome:
     """
     POST /alphas/{id}/submit only ever means ACCEPTED, never SUBMITTED.
     We then poll the alpha itself until status == ACTIVE. See module docstring
@@ -279,16 +279,62 @@ def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 
 
     t0 = time.time()
     fail_polls = 0
+    operation_url = post.headers.get("Location")
+    if operation_url:
+        operation_url = urljoin(ace.brain_api_url + "/", operation_url)
+    ignore = {str(n).upper() for n in ignore_names}
+
+    def failed_checks(detail):
+        checks = (detail.get("is") or {}).get("checks") or []
+        return [
+            c for c in checks
+            if isinstance(c, dict)
+            and c.get("result") == "FAIL"
+            and str(c.get("name")).upper() not in ignore
+        ]
+
     while True:
+        operation = None
+        if operation_url:
+            operation = s.get(operation_url)
+            if operation.status_code == 403:
+                try:
+                    operation_detail = operation.json() or {}
+                except Exception:
+                    operation_detail = {}
+                operation_failed = failed_checks(operation_detail)
+                if operation_failed:
+                    desc = [f"{c.get('name')} (value={c.get('value')}, limit={c.get('limit')})" for c in operation_failed]
+                    return SubmitOutcome(
+                        False, False, "rejected_after_accept", code,
+                        f"submission operation rejected: {desc}",
+                        operation_detail.get("status"), raw=_raw_post(operation),
+                    )
+                return SubmitOutcome(
+                    False, True, "submission_operation", operation.status_code,
+                    "submission operation returned HTTP 403 without failure details",
+                    raw=_raw_post(operation),
+                )
+
         detail = ace.get_simulation_result_json(s, alpha_id) or {}
         status = detail.get("status")
 
         if status == "ACTIVE":
             return SubmitOutcome(True, False, "active", code, "alpha is ACTIVE", status)
 
-        checks = (detail.get("is") or {}).get("checks") or []
-        ignore = {str(n).upper() for n in ignore_names}
-        failed_c = [c for c in checks if isinstance(c, dict) and c.get("result") == "FAIL" and str(c.get("name")).upper() not in ignore]
+        failed_c = failed_checks(detail)
+        if show_polling:
+            pending_count = sum(
+                1 for c in (detail.get("is") or {}).get("checks", [])
+                if isinstance(c, dict) and c.get("result") == "PENDING"
+            )
+            operation_status = operation.status_code if operation is not None else "not-polled"
+            retry_after = operation.headers.get("Retry-After") if operation is not None else None
+            util.say(
+                f"    submit poll {alpha_id}: operation_http={operation_status} "
+                f"retry_after={retry_after or '-'} alpha_status={status or '-'} "
+                f"pending_checks={pending_count} failed_checks={len(failed_c)}"
+            )
         if failed_c:
             fail_polls += 1
             # must persist across 2 polls, so one stale/transitional read can't reject an alpha that is going through
@@ -306,4 +352,12 @@ def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 
                 status,
                 raw=f"POST response:\n{_raw_post(post)}\nlast alpha detail:\n{_raw_detail(detail)}",
             )
-        time.sleep(poll_every_s)
+        wait_s = poll_every_s
+        if operation is not None:
+            try:
+                retry_after = float(operation.headers.get("Retry-After", 0) or 0)
+            except (TypeError, ValueError):
+                retry_after = 0
+            if retry_after > 0:
+                wait_s = retry_after
+        time.sleep(wait_s)
