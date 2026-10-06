@@ -19,10 +19,9 @@ services:
   # (survives until you `docker compose down`, and restarts itself if Docker
   # or the machine restarts). Send it commands with `docker compose exec`.
   #   docker compose up -d alphapilot-daemon
-  #   docker compose exec alphapilot-daemon alphapilot        (menu)
+  #   docker compose exec -it alphapilot-daemon alphapilot     (menu)
   #   docker compose exec alphapilot-daemon alphapilot run
   alphapilot-daemon:
-    build: .
     image: alphapilot:latest
     volumes:
       - ./data:/data

@@ -62,14 +62,15 @@ simulation run continue unattended, or checking in on it periodically).
 
 ```bash
 docker compose up -d alphapilot-daemon        # starts it, runs in the background
-docker compose exec alphapilot-daemon alphapilot          # menu
+docker compose exec -it alphapilot-daemon alphapilot       # menu (interactive)
 docker compose exec alphapilot-daemon alphapilot run
 docker compose exec alphapilot-daemon alphapilot status
 ```
 
-`restart: unless-stopped` means it comes back on its own if Docker restarts
-or your machine reboots — you don't need to re-launch it every day. To stop
-it entirely:
+The daemon is an idle container; it does not run simulations by itself. Use
+`exec` to launch each command, and keep the terminal open to see its output.
+`restart: unless-stopped` only brings that idle container back if Docker
+restarts or your machine reboots. To stop it entirely:
 
 ```bash
 docker compose down
@@ -78,12 +79,16 @@ docker compose down
 Nothing on `./data` is affected by starting/stopping the daemon — your
 config, login, and progress are all still there next time.
 
-**Note on unattended/background runs:** if a face check comes up while
-nobody's watching (session expired), alphapilot prints the link and waits
-up to `session.persona_timeout_min` minutes (20 by default), then gives up
-cleanly rather than hanging forever. Check `docker compose logs alphapilot-daemon`
-if a scheduled run seems stuck, open the link if one's shown, and re-run the
-command.
+For a long-running simulation, start this in a terminal and leave it attached
+so prompts and progress remain visible:
+
+```bash
+docker compose exec alphapilot-daemon alphapilot run
+```
+
+If a face check comes up while nobody's watching, alphapilot prints the link
+and waits up to `session.persona_timeout_min` minutes (20 by default), then
+exits cleanly. Open the link and rerun the command.
 
 ### Without Docker at all
 

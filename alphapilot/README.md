@@ -72,6 +72,14 @@ docker compose run --rm alphapilot run
 Everything under `./data` on your host is the container's `/data` - config,
 state, credentials, logs. Nothing is lost between container runs.
 
+This is a command-line tool, not a web service: it listens on no port and
+prints its output in the terminal running `docker compose run`. `run` gives
+the container an interactive terminal for the menu and login prompts; direct
+commands such as `status` can also be run without prompts. The image needs
+outbound access to the WorldQuant BRAIN API (and to the configured LLM provider
+if you select one). The ACE API source folder is copied into the image at
+build time; it is not a running service or a host port.
+
 **About the face check in Docker:** the container has no camera or browser,
 so when a face check is needed, `alphapilot` prints the link and waits (it
 does not try to open a browser inside the container). Open that link on your
@@ -182,4 +190,3 @@ packs/                dataset packs - one .py file per dataset
 data/                 created by `init`; config, state, secrets (gitignored)
 Dockerfile, docker-compose.yml
 ```
-
