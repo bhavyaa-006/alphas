@@ -8,11 +8,56 @@ import logging.handlers
 import os
 import re
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 LOGGER = logging.getLogger("alphapilot")
+
+
+class Theme:
+    """Terminal presentation policy shared by all user-facing output."""
+
+    _COLORS = {
+        "accent": "\x1b[94m",
+        "success": "\x1b[92m",
+        "warning": "\x1b[93m",
+        "error": "\x1b[91m",
+        "muted": "\x1b[90m",
+        "border": "\x1b[90m",
+        "reset": "\x1b[0m",
+        "bold": "\x1b[1m",
+    }
+
+    @staticmethod
+    def enabled() -> bool:
+        """Enable styling only for an interactive terminal explicitly allowing color."""
+        try:
+            return (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+                    and not os.environ.get("CI") and os.environ.get("TERM") != "dumb")
+        except (AttributeError, OSError):
+            return False
+
+    @staticmethod
+    def symbol(unicode_symbol: str, ascii_symbol: str) -> str:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        try:
+            unicode_symbol.encode(encoding)
+            return unicode_symbol
+        except (UnicodeEncodeError, LookupError):
+            return ascii_symbol
+
+    @classmethod
+    def paint(cls, value: str, role: str) -> str:
+        if not cls.enabled():
+            return value
+        color = cls._COLORS.get(role, "")
+        if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit"):
+            color = {
+                "accent": "\x1b[38;2;105;184;255m", "success": "\x1b[38;2;105;200;150m",
+                "warning": "\x1b[38;2;235;185;95m", "error": "\x1b[38;2;235;115;115m",
+                "muted": "\x1b[38;2;145;155;170m", "border": "\x1b[38;2;80;95;115m",
+            }.get(role, color)
+        return f"{color}{value}{cls._COLORS['reset']}"
 
 # an identifier directly followed by "(" is an operator call
 OP_RE = re.compile(r"\b([a-z_][a-z0-9_]*)\s*\(")
@@ -56,7 +101,7 @@ def in_docker() -> bool:
 
 def is_tty() -> bool:
     try:
-        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+        return bool(sys.stdin.isatty() and sys.stdout.isatty() and Theme.enabled())
     except Exception:
         return False
 
@@ -152,18 +197,32 @@ def setup_logging(log_file, verbose: bool = False) -> None:
 
 
 def say(msg: str = "", level: int = logging.INFO, stamp: bool = True) -> None:
-    """User-facing line: printed with a timestamp and also written to the log file."""
-    text = f"{time.strftime('%H:%M:%S')}  {msg}" if (stamp and msg) else msg
+    """Write concise user output to stdout and the original message to the log."""
+    text = msg
+    if msg:
+        for prefix, role in (("HALTED:", "error"), ("Error:", "error"), ("!!", "warning"),
+                             ("Interrupted", "warning"), ("SUBMITTED:", "success"),
+                             ("OK", "success"), ("Face check needed:", "accent")):
+            if msg.lstrip().startswith(prefix):
+                text = msg.replace(prefix, Theme.paint(prefix, role), 1)
+                break
     print(text, flush=True)
     LOGGER.log(level, msg)
 
 
 def banner(lines, char: str = "=") -> None:
-    width = max(len(x) for x in lines) + 4
-    width = min(max(width, 40), 100)
+    """Render a compact, width-aware section heading without an oversized box."""
+    if not lines:
+        return
+    title, *details = lines
     print(flush=True)
-    print(char * width)
-    for x in lines:
-        print(f"  {x}")
-    print(char * width, flush=True)
+    print(f"{Theme.symbol('✦', '*')} {Theme.paint(title, 'accent')}")
+    for line in details:
+        print(f"  {Theme.paint(line, 'muted')}")
+    try:
+        width = os.get_terminal_size(sys.stdout.fileno()).columns
+    except (OSError, AttributeError, ValueError):
+        width = 80
+    rule = Theme.symbol("─", "-") * max(12, min(width, 100))
+    print(Theme.paint(rule, "border"), flush=True)
     LOGGER.info("BANNER: %s", " | ".join(lines))

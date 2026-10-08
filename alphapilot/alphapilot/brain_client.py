@@ -154,6 +154,19 @@ def ensure_session(ace, cfg, home, force_relogin: bool = False, on_persona_link=
     including the face check when BRAIN asks for it.
     """
     s = ace.SingleSession()
+    # requests has no default timeout.  A single stalled socket otherwise
+    # bypasses every higher-level polling deadline and leaves claimed rows in
+    # `simulating` until the next process restart.
+    s._alphapilot_request_timeout = cfg.api.timeout_s
+    if not getattr(s, "_alphapilot_timeout_installed", False):
+        original_request = s.request
+
+        def request_with_timeout(method, url, **kwargs):
+            kwargs.setdefault("timeout", s._alphapilot_request_timeout)
+            return original_request(method, url, **kwargs)
+
+        s.request = request_with_timeout
+        s._alphapilot_timeout_installed = True
     from .util import load_dotenv
 
     load_dotenv(home / ".env")
@@ -262,7 +275,15 @@ def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 
     while the first is still going through.
     """
     url = f"{ace.brain_api_url}/alphas/{alpha_id}/submit"
-    post = s.post(url)
+    try:
+        post = s.post(url)
+    except Exception as e:
+        # The request may have reached BRAIN even if the client did not receive
+        # its response. Treat this as ambiguous and never submit it again blindly.
+        return SubmitOutcome(
+            False, True, "post_unknown", None,
+            f"submit request outcome is unknown after {type(e).__name__}: {e}",
+        )
     code = post.status_code
 
     if code in (401, 404, 405, 429) or code >= 500:
@@ -294,9 +315,17 @@ def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 
         ]
 
     while True:
+        alpha_poll_wait = 0.0
         operation = None
         if operation_url:
-            operation = s.get(operation_url)
+            try:
+                operation = s.get(operation_url)
+            except Exception as e:
+                return SubmitOutcome(
+                    False, True, "submission_operation", code,
+                    f"submission was accepted but operation polling failed ({type(e).__name__}: {e}); outcome is unknown",
+                    raw=f"POST response:\n{_raw_post(post)}",
+                )
             if operation.status_code == 403:
                 try:
                     operation_detail = operation.json() or {}
@@ -316,7 +345,43 @@ def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 
                     raw=_raw_post(operation),
                 )
 
-        detail = ace.get_simulation_result_json(s, alpha_id) or {}
+        try:
+            alpha_response = s.get(f"{ace.brain_api_url}/alphas/{alpha_id}")
+        except Exception as e:
+            return SubmitOutcome(
+                False, True, "alpha_poll", code,
+                f"submission was accepted but alpha polling failed ({type(e).__name__}: {e}); outcome is unknown",
+                raw=f"POST response:\n{_raw_post(post)}",
+            )
+        if alpha_response.status_code == 401 or alpha_response.status_code == 403:
+            return SubmitOutcome(
+                False, True, "alpha_poll", alpha_response.status_code,
+                "session expired or access denied while checking submission outcome",
+                raw=f"POST response:\n{_raw_post(post)}\nalpha poll:\n{_raw_post(alpha_response)}",
+            )
+        if alpha_response.status_code == 429 or alpha_response.status_code >= 500:
+            try:
+                alpha_poll_wait = float(alpha_response.headers.get("Retry-After", 0) or 0)
+            except (TypeError, ValueError):
+                alpha_poll_wait = 0.0
+            detail = {}
+        elif alpha_response.status_code // 100 != 2:
+            return SubmitOutcome(
+                False, True, "alpha_poll", alpha_response.status_code,
+                f"could not determine submission outcome: alpha poll HTTP {alpha_response.status_code}",
+                raw=f"POST response:\n{_raw_post(post)}\nalpha poll:\n{_raw_post(alpha_response)}",
+            )
+        else:
+            try:
+                detail = alpha_response.json() or {}
+                if not isinstance(detail, dict):
+                    raise ValueError("response was not a JSON object")
+            except (ValueError, TypeError) as e:
+                return SubmitOutcome(
+                    False, True, "alpha_poll", alpha_response.status_code,
+                    f"could not determine submission outcome from alpha response: {e}",
+                    raw=f"POST response:\n{_raw_post(post)}\nalpha poll:\n{_raw_post(alpha_response)}",
+                )
         status = detail.get("status")
 
         if status == "ACTIVE":
@@ -360,4 +425,6 @@ def submit_alpha(ace, s, alpha_id: str, timeout_s: float, poll_every_s: float = 
                 retry_after = 0
             if retry_after > 0:
                 wait_s = retry_after
-        time.sleep(wait_s)
+        if alpha_poll_wait > 0:
+            wait_s = max(wait_s, alpha_poll_wait)
+        time.sleep(min(wait_s, max(0.0, timeout_s - (time.time() - t0))))

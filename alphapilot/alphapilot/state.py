@@ -468,9 +468,10 @@ class Store:
             )
 
     def reconcile_candidates(self, limit: int = 50):
-        """Recently rejected rows - re-checked against the platform in case they were later submitted by hand."""
+        """Rejected or ambiguous rows re-checked against BRAIN before any future submit."""
         rows = self.conn.execute(
-            "SELECT * FROM alphas WHERE status IN ('submit_rejected','check_fail') AND alpha_id IS NOT NULL "
+            "SELECT * FROM alphas WHERE (status IN ('submit_rejected','check_fail') OR check_result='UNSURE') "
+            "AND alpha_id IS NOT NULL "
             "ORDER BY updated_at DESC LIMIT ?", (limit,)
         ).fetchall()
         return self._rows_to_alphas(rows)
@@ -502,6 +503,7 @@ class Store:
     def submit_candidates(self, min_sharpe: float, min_fitness: float, limit: int, focus=None):
         base = (
             "SELECT * FROM alphas WHERE status='simulated' AND (n_fail IS NULL OR n_fail=0) "
+            "AND (check_result IS NULL OR check_result!='UNSURE') "
             "AND (sharpe IS NULL OR sharpe >= ?) AND (fitness IS NULL OR fitness >= ?)"
         )
         order = " ORDER BY fitness DESC NULLS LAST, sharpe DESC NULLS LAST LIMIT ?"

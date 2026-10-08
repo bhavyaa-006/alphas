@@ -85,17 +85,34 @@ def _poll_simulation(ace, s, sim_id_or_url: str, timeout_min: float, max_retry_a
     url = sim_id_or_url if sim_id_or_url.startswith("http") else f"{ace.brain_api_url}/simulations/{sim_id_or_url}"
     deadline = time.time() + timeout_min * 60
     while True:
+        if time.time() >= deadline:
+            return {"status": "TIMEOUT", "message": f"gave up polling after {timeout_min:.0f} minutes"}
         r = s.get(url)
+        if r.status_code // 100 != 2:
+            # GET is safe to retry, but keep the polling window finite.
+            if r.status_code == 429 or r.status_code >= 500:
+                try:
+                    retry_after = float(r.headers.get("Retry-After", 1) or 1)
+                except (TypeError, ValueError):
+                    retry_after = 1
+                wait = min(max_retry_after_s, max(1.0, retry_after))
+                time.sleep(min(wait, max(0.0, deadline - time.time())))
+                continue
+            return {"status": "ERROR", "message": f"poll HTTP {r.status_code}: {r.text[:400]}"}
         wait = 0.0
         try:
             wait = float(r.headers.get("Retry-After", 0) or 0)
         except (TypeError, ValueError):
             pass
         if wait <= 0:
-            return r.json()
+            try:
+                data = r.json()
+                return data if isinstance(data, dict) else {"status": "ERROR", "message": "poll returned non-object JSON"}
+            except (ValueError, TypeError) as e:
+                return {"status": "ERROR", "message": f"invalid poll response JSON: {e}; body={r.text[:400]}"}
         if time.time() > deadline:
             return {"status": "TIMEOUT", "message": f"gave up polling after {timeout_min:.0f} minutes"}
-        time.sleep(min(wait, max_retry_after_s))
+        time.sleep(min(wait, max_retry_after_s, max(0.0, deadline - time.time())))
 
 
 def _simulate_one(ace, s, alpha_dict: dict, timeout_min: float, max_retry_after_s: float) -> dict:
@@ -150,6 +167,17 @@ def _simulate_batch_with_fallback(ace, s, cfg, alpha_dicts: list) -> list:
             any_missing = True
             results.append({"alpha_id": None, "simulate_data": alpha_dict, "error": None})  # re-diagnosed below
 
+    # A short children list is a malformed/incomplete parent response.  Do not
+    # silently drop claimed inputs: diagnose the unpaired expressions too.
+    if len(children) < len(alpha_dicts):
+        any_missing = True
+        results.extend(
+            {"alpha_id": None, "simulate_data": alpha_dict, "error": None}
+            for alpha_dict in alpha_dicts[len(children):]
+        )
+    if len(children) > len(alpha_dicts):
+        LOGGER.warning("BRAIN batch returned %d children for %d inputs; ignoring extras", len(children), len(alpha_dicts))
+
     if not any_missing:
         return results
 
@@ -185,6 +213,7 @@ def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optiona
     # function returned, so error_streak_halt (default 20) could never fire and a systemic
     # failure (bad session, broken settings, etc.) would silently burn through the whole pool.
     rs.consecutive_errors = int(store.get_meta("consecutive_errors", 0) or 0)
+    rate_limit_retries = 0
     n_requeued = store.requeue_stuck()
     if n_requeued:
         say(f"recovered {n_requeued} expression(s) left mid-batch by a previous interrupted run")
@@ -205,16 +234,51 @@ def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optiona
                 "UPDATE alphas SET status='pending' WHERE expr IN (%s)" % ",".join("?" * len(batch)), batch
             )
             store.conn.commit()
-            if cfg.simulation.on_daily_limit == "wait" and e.retry_after:
+            if cfg.simulation.on_daily_limit == "wait" and e.retry_after and rate_limit_retries < cfg.simulation.max_attempts:
+                rate_limit_retries += 1
                 say(f"rate limited - waiting {fmt_duration(e.retry_after)} before retrying")
                 time.sleep(min(e.retry_after, 3600))
                 continue
             store.log_event("rate_limited", str(e))
             raise EngineHalt(f"Simulation rate/daily limit reached: {e}. Re-run later to continue - progress is saved.") from e
+        except Exception as e:
+            # No claimed row may be left in `simulating` after a failed request,
+            # malformed response, or unexpected client exception.
+            detail = f"{type(e).__name__}: {e}"
+            LOGGER.exception("[BATCH] simulation failed batch_size=%d", len(batch))
+            store.log_event("batch_exception", detail[:2000])
+            for expr in batch:
+                store.mark_error(expr, detail)
+                rs.simulated_err += 1
+                rs.consecutive_errors += 1
+                rs.last_error_sample = detail
+            store.set_meta("consecutive_errors", str(rs.consecutive_errors))
+            if rs.consecutive_errors >= cfg.simulation.error_streak_halt:
+                store.log_event("error_streak_halt", f"{rs.consecutive_errors} consecutive batch errors: {detail}")
+                raise EngineHalt(
+                    f"Stopped after {rs.consecutive_errors} consecutive batch errors: {detail}. "
+                    "The batch has been recorded as failed and can be retried later."
+                ) from e
+            rs.batches_run += 1
+            if on_progress:
+                on_progress(rs, store.counts())
+            continue
+
+        rate_limit_retries = 0
+        if len(results) != len(batch):
+            detail = f"internal result count mismatch: received {len(results)} results for {len(batch)} claimed expressions"
+            LOGGER.error("[BATCH] %s; marking unpaired expressions failed", detail)
+            store.log_event("batch_result_mismatch", detail)
+            results = list(results[:len(batch)])
+            results.extend(
+                {"alpha_id": None, "simulate_data": alpha_dicts[i], "error": detail}
+                for i in range(len(results), len(batch))
+            )
 
         for expr, r in zip(batch, results):
             if r["alpha_id"] is None:
                 err = r.get("error") or "simulation failed (no alpha_id)"
+                LOGGER.warning("[ALPHA] simulation failed stage=simulation expr=%r error=%s", expr[:240], err[:500])
                 store.mark_error(expr, err)
                 rs.simulated_err += 1
                 rs.consecutive_errors += 1
@@ -233,8 +297,17 @@ def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optiona
                         "simulation.error_streak_halt in config.yaml if this is a false alarm."
                     )
                 continue
-            info = _fetch_stats(ace, s, r["alpha_id"], r["simulate_data"])
-            store.mark_simulated(expr, r["alpha_id"], info["stats"], info["failed_tests"])
+            try:
+                info = _fetch_stats(ace, s, r["alpha_id"], r["simulate_data"])
+                store.mark_simulated(expr, r["alpha_id"], info["stats"], info["failed_tests"])
+            except Exception as e:
+                LOGGER.exception("[ALPHA] post-simulation stats failed for alpha_id=%s", r["alpha_id"])
+                store.mark_error(expr, f"stats retrieval failed for alpha_id={r['alpha_id']}: {type(e).__name__}: {e}")
+                rs.simulated_err += 1
+                rs.consecutive_errors += 1
+                rs.last_error_sample = str(e)
+                store.set_meta("consecutive_errors", str(rs.consecutive_errors))
+                continue
             rs.simulated_ok += 1
             rs.consecutive_errors = 0
             store.set_meta("consecutive_errors", "0")
@@ -268,7 +341,13 @@ _RECONCILED = {"done": False}
 
 def _platform_status(ace, s, alpha_id: str):
     try:
-        return (ace.get_simulation_result_json(s, alpha_id) or {}).get("status")
+        # Read once instead of using ace_lib.get_simulation_result_json(), whose
+        # Retry-After loop is unbounded and can outlive the run's deadlines.
+        response = s.get(f"{ace.brain_api_url}/alphas/{alpha_id}")
+        if response.status_code // 100 != 2:
+            return None
+        detail = response.json()
+        return detail.get("status") if isinstance(detail, dict) else None
     except Exception:
         return None
 
@@ -277,7 +356,11 @@ def _alpha_page_checks(ace, s, alpha_id: str):
     """The alpha's own is.checks as the platform reports them (what the website renders). None if unavailable."""
     import pandas as pd
     try:
-        lst = ((ace.get_simulation_result_json(s, alpha_id) or {}).get("is") or {}).get("checks") or []
+        response = s.get(f"{ace.brain_api_url}/alphas/{alpha_id}")
+        if response.status_code // 100 != 2:
+            return None
+        detail = response.json()
+        lst = ((detail if isinstance(detail, dict) else {}).get("is") or {}).get("checks") or []
         df = pd.DataFrame([c for c in lst if isinstance(c, dict)])
     except Exception:
         return None
@@ -335,9 +418,14 @@ def run_submission_cycle(ace, s, cfg, pack, store: Store, ask_fn: Optional[Calla
             say(f"  stopping submission cycle: {cap.reason}")
             break
 
-        if _platform_status(ace, s, cand.alpha_id) == "ACTIVE":
+        platform_status = _platform_status(ace, s, cand.alpha_id)
+        if platform_status == "ACTIVE":
             store.mark_submitted(cand.expr, cand.alpha_id, "(submitted outside alphapilot)", "", "manual", cfg.submit.timezone)
             say(f"  {cand.alpha_id} is already ACTIVE on the platform - recorded as submitted, not counted toward this run")
+            continue
+        if platform_status is None:
+            say(f"  could not read platform status for {cand.alpha_id}; skipping without submitting")
+            _SKIP_THIS_PROCESS.add(cand.expr)
             continue
 
         say(f"  checking {cand.alpha_id}  sharpe={cand.sharpe}  fitness={cand.fitness}")
@@ -459,6 +547,9 @@ def check_candidate_platform(ace, s, cand: Alpha, store: Store, cfg) -> tuple[st
     if st == "ACTIVE":
         store.mark_submitted(cand.expr, cand.alpha_id, "(submitted outside alphapilot)", "", "manual", cfg.submit.timezone)
         return "ACTIVE", f"{cand.alpha_id} is already ACTIVE on platform (marked as submitted)"
+    if st is None:
+        store.mark_check(cand.expr, "UNKNOWN", "could not read alpha status from BRAIN")
+        return "UNKNOWN", "could not read alpha status from BRAIN"
 
     api_checks = ace.get_check_submission(s, cand.alpha_id)
     if api_checks is None or len(api_checks) == 0:
@@ -497,6 +588,8 @@ def submit_candidate_now(ace, s, cfg, pack, store: Store, cand: Alpha) -> tuple[
     if st == "ACTIVE":
         store.mark_submitted(cand.expr, cand.alpha_id, "(submitted outside alphapilot)", "", "manual", cfg.submit.timezone)
         return True, f"{cand.alpha_id} is already ACTIVE on platform (marked as submitted)"
+    if st is None:
+        return False, f"Could not read platform status for {cand.alpha_id}; not submitting while its state is unknown"
 
     meta = LLM.generate_metadata(
         cfg, cand.expr, pack.fields, pack.name, _settings_text(pack),
@@ -529,4 +622,3 @@ def submit_candidate_now(ace, s, cfg, pack, store: Store, cand: Alpha) -> tuple[
         store.mark_submit_rejected(cand.expr, f"{outcome.stage}: {outcome.detail}\n{outcome.raw}")
         store.log_event("submit_rejected_raw", f"{cand.alpha_id}\n{outcome.raw}")
         return False, f"REJECTED: {outcome.detail}"
-

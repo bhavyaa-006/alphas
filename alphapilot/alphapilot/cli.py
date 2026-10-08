@@ -12,7 +12,7 @@ from . import packs_api as P
 from . import secrets as SEC
 from . import state as ST
 from . import brain_client as BC
-from .util import banner, say, setup_logging, fmt_duration, in_docker
+from .util import banner, say, setup_logging, fmt_duration, in_docker, Theme
 
 
 def _pack_dirs(here: Path, home: Path):
@@ -195,7 +195,7 @@ def cmd_doctor(args):
 
 def _resolve_home(args):
     home = C.resolve_home(args.home)
-    print(f"(using --home: {home})")
+    print(f"(using --home: {home})", file=sys.stderr)
     return home
 
 
@@ -632,8 +632,12 @@ def main(argv=None):
         print(f"Pack error:\n{e}", file=sys.stderr)
         return 1
     except BC.BrainError as e:
-        print(f"BRAIN error:\n{e}", file=sys.stderr)
+        mark = Theme.symbol("✕", "x")
+        print(f"{Theme.paint(mark + ' BRAIN error', 'error')}\n  {e}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        print(f"{Theme.paint('! Operation cancelled', 'warning')}", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":
