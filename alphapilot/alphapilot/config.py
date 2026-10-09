@@ -164,6 +164,15 @@ def load_config(home: Path, overrides=None) -> Cfg:
 def validate(c: dict) -> list:
     bad = []
 
+    # YAML 1.1 resolves `off`/`on`/`yes`/`no` as booleans, so the string
+    # field submit.mode loses its legitimate literal `off` when set via
+    # `--set submit.mode=off`, `/settings /submit-mode off`, or a hand-edited
+    # config.yaml.  Coerce it back before validating (booleans for genuinely
+    # boolean fields such as submit.show_polling are left untouched).
+    submit_node = c.get("submit")
+    if isinstance(submit_node, dict) and submit_node.get("mode") is False:
+        submit_node["mode"] = "off"
+
     def num(path, lo=None, hi=None, integer=False):
         node = c
         for p in path.split("."):

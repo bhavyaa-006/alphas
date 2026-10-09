@@ -394,11 +394,33 @@ class AgentTerminal:
         return await self.command_terminal.execute(raw)
 
 
-def main(home_arg=None):
-    """Start the model-free interactive command shell."""
-    home = CFG.resolve_home(home_arg)
+def _fullscreen_available() -> bool:
+    """The persistent full-screen UI needs a real terminal; scripts, pipes
+    and tests keep the legacy prompt loop."""
+    flag = os.environ.get("ALPHAPILOT_FULLSCREEN", "").strip().lower()
+    if flag in {"0", "off", "no", "false"}:
+        return False
     try:
-        return asyncio.run(CommandTerminal(home).start())
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def main(home_arg=None):
+    """Start the model-free interactive command shell.
+
+    On a real terminal this is the persistent full-screen ALPHAS UI (fixed
+    header, dynamic workspace, fixed input bar); otherwise it falls back to
+    the plain prompt loop used by tests and piped sessions.
+    """
+    home = CFG.resolve_home(home_arg)
+    terminal = CommandTerminal(home)
+    try:
+        if _fullscreen_available():
+            from . import fullscreen
+
+            return fullscreen.run(terminal)
+        return asyncio.run(terminal.start())
     except KeyboardInterrupt:
         print("\nBye.")
         return 0
@@ -424,6 +446,10 @@ class CommandTerminal:
         self.console = Console()
         self.context = "main"
         self.context_stack = []
+        # When the full-screen UI drives this terminal it installs a cancel
+        # token so Ctrl+C can stop long-running handlers that support it
+        # (`/run`); None keeps the legacy one-shot invocation byte-identical.
+        self.cancel_event = None
         self.history_file = self.home / "history"
         self.home.mkdir(parents=True, exist_ok=True)
         self.session = PromptSession(
@@ -603,8 +629,13 @@ class CommandTerminal:
 
     def _cli(self, command: str, arguments: list[str]) -> bool:
         from . import cli
+        argv = ["--home", str(self.home), command, *arguments]
         try:
-            code = cli.main(["--home", str(self.home), command, *arguments])
+            cancel_event = getattr(self, "cancel_event", None)
+            if cancel_event is None:
+                code = cli.main(argv)
+            else:
+                code = cli.main(argv, cancel_event=cancel_event)
         except SystemExit as exc:
             code = int(exc.code or 0)
         if code:

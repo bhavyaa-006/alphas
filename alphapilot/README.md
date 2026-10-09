@@ -51,15 +51,26 @@ alphapilot jump 0                # undo that - include the whole pool again
 
 ## Interactive command shell and optional AI
 
-The no-argument CLI and `alphapilot menu` open a modern command shell. Its
-only slash commands are `/setup`, `/run`, `/candidates`, `/status`, `/fields`,
-`/errors`, `/retry`, `/history`, `/jump`, `/settings`, `/doctor`, `/reset`,
-and `/exit`. Type `?` or `/` at the prompt to display their descriptions and
-usage examples. For example, `/run --simulate` runs without submitting and
-`/candidates --field <field> --submit` submits an eligible candidate through
-the existing safeguards. Input is dispatched deterministically; it is never
-sent to a model for interpretation. The original numbered menu remains
-available through `alphapilot legacy-menu`.
+The no-argument CLI and `alphapilot menu` open a persistent full-screen
+command shell: a branded `ALPHAS` header is pinned to the top of the
+terminal, a dynamically updated — and independently scrollable — workspace
+occupies the middle (menus, command output, help, progress, errors,
+results), and the command input with a compact context/shortcuts status line
+is pinned to the bottom. The screen is rendered once with prompt_toolkit's
+full-screen application on a real terminal (piped sessions and tests keep a
+plain prompt loop), so output from long-running commands can never scroll
+the header or the input bar away. Scroll the workspace with PgUp/PgDn, the
+mouse wheel, or Shift+arrows when it overflows; the terminal can be resized
+freely at any time.
+
+Its only slash commands are `/setup`, `/run`, `/candidates`, `/status`,
+`/fields`, `/errors`, `/retry`, `/history`, `/jump`, `/settings`, `/doctor`,
+`/reset`, and `/exit`. Type `?` or `/` at the prompt to display their
+descriptions and usage examples. For example, `/run --simulate` runs without
+submitting and `/candidates --field <field> --submit` submits an eligible
+candidate through the existing safeguards. Input is dispatched
+deterministically; it is never sent to a model for interpretation. The
+original numbered menu remains available through `alphapilot legacy-menu`.
 
 Free-form research chat remains an explicit optional feature: run
 `alphapilot chat`. It streams from the configured OpenAI-compatible chat API

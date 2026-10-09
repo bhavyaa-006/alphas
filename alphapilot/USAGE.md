@@ -108,10 +108,28 @@ around it.
 ## 3. The interactive command shell
 
 `alphapilot` (or `docker compose run --rm alphapilot` with no extra word)
-opens the modern deterministic command shell. The only slash commands are
-`/setup`, `/run`, `/candidates`, `/status`, `/fields`, `/errors`, `/retry`,
-`/history`, `/jump`, `/settings`, `/doctor`, `/reset`, and `/exit`. Type `?`
-or `/` for descriptions and usage examples. For example, `/run --simulate`
+opens the modern deterministic command shell as a persistent full-screen UI:
+
+```text
+┌──────────────────────────────────────────────┐
+│  ALPHAS                     (fixed header)   │
+├──────────────────────────────────────────────┤
+│                                             │
+│  dynamic workspace                          │  ← menus, output, help,
+│  (scrolls on its own: PgUp/PgDn, wheel,      │    progress, errors, results
+│   Shift+arrows)                             │
+│                                             │
+├──────────────────────────────────────────────┤
+│  > input bar              (fixed at bottom)  │
+│  status: context · shortcuts                 │
+└──────────────────────────────────────────────┘
+```
+
+The header and input bar never move; only the middle workspace changes as
+commands run. Resize the terminal freely — the layout adapts. The only
+slash commands are `/setup`, `/run`, `/candidates`, `/status`, `/fields`,
+`/errors`, `/retry`, `/history`, `/jump`, `/settings`, `/doctor`, `/reset`,
+and `/exit`. Type `?` or `/` for descriptions and usage examples. For example, `/run --simulate`
 runs without submitting and `/candidates --field <field> --submit` follows
 the existing eligibility and submission checks. Direct CLI commands remain
 available for scripts. Free-form model chat is isolated behind

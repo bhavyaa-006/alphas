@@ -810,7 +810,7 @@ def build_parser():
     return p
 
 
-def main(argv=None):
+def main(argv=None, *, cancel_event=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
@@ -821,6 +821,10 @@ def main(argv=None):
             parser.print_help()
             return 0
         args.func = cmd_menu
+    if cancel_event is not None and getattr(args, "func", None) is cmd_run:
+        # The interactive UI passes its Ctrl+C token so a long `/run` can be
+        # cancelled gracefully; handlers themselves are unchanged.
+        args.cancel_event = cancel_event
     try:
         return args.func(args) or 0
     except C.ConfigError as e:
