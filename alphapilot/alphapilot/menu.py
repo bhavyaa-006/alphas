@@ -518,6 +518,10 @@ def _jump_screen(home: Path):
 def main_menu(home_arg=None):
     home = CFG.resolve_home(home_arg)
     history_file = home / "history"
+    # Keep one deterministic slash terminal for the compatibility menu so a
+    # context entered with /settings or /run survives the next prompt.
+    from .agent_cli import CommandTerminal
+    slash_terminal = CommandTerminal(home)
     print("ALPHAPILOT  |  WorldQuant BRAIN research agent")
     print("Use one of the 13 slash commands. Type ? or / for the command reference.\n")
     while True:
@@ -564,11 +568,7 @@ def main_menu(home_arg=None):
             return 0
 
         if choice == "?" or choice == "/" or (choice and choice.startswith("/")):
-            from .agent_cli import CommandTerminal, command_reference
-            if choice in ("?", "/"):
-                print(command_reference())
-                continue
-            if asyncio.run(CommandTerminal(home).execute(choice)):
+            if asyncio.run(slash_terminal.execute(choice)):
                 print("Bye.")
                 return 0
             continue

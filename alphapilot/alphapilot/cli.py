@@ -282,7 +282,12 @@ def cmd_run(args):
         print(f"\nSubmit {cand.alpha_id}? sharpe={cand.sharpe} fitness={cand.fitness}")
         print(f"  name: {meta.name}  category: {meta.category}")
         print(f"  {meta.description[:300]}...")
-        return input("  Submit? [y/N] ").strip().lower() == "y"
+        while True:
+            answer = input("  Submit? [y/N] ").strip().lower()
+            if answer == "?":
+                print("This confirms submission of the displayed alpha. Enter y to submit or n/Enter to skip.")
+                continue
+            return answer == "y"
 
     banner([
         f"alphapilot run · pack={pack.name}",
@@ -498,6 +503,37 @@ def cmd_candidates(args):
 
     do_check = getattr(args, "check", False)
     do_submit = getattr(args, "submit", False)
+    candidate_number = getattr(args, "candidate", None)
+    action = getattr(args, "candidate_action", None)
+    if candidate_number is not None:
+        if candidate_number < 1 or candidate_number > len(cands):
+            print(f"Candidate number must be between 1 and {len(cands)}.")
+            store.close()
+            return 2
+        selected = cands[candidate_number - 1]
+        if action == "inspect":
+            print(f"alpha_id: {selected.alpha_id or '-'}")
+            print(f"fields: {selected.fields or '-'}")
+            print(f"sharpe: {selected.sharpe}  fitness: {selected.fitness}  turnover: {selected.turnover}")
+            print(f"margin: {selected.margin}  returns: {selected.returns}")
+            print(f"check_result: {selected.check_result or 'not checked yet'}")
+            print(f"expression: {selected.expr}")
+            store.close()
+            return 0
+        if action == "fail":
+            store.mark_check(selected.expr, "FAIL", getattr(args, "reason", None) or "manually skipped")
+            print(f"Marked {selected.alpha_id or candidate_number} as check_fail.")
+            store.close()
+            return 0
+        if action == "manual_active":
+            store.mark_submitted(selected.expr, selected.alpha_id, "(manual active)", "", "manual", cfg.submit.timezone)
+            print(f"Marked {selected.alpha_id or candidate_number} as submitted.")
+            store.close()
+            return 0
+        if action == "check":
+            do_check = True
+        if action == "submit":
+            do_submit = True
 
     if do_check or do_submit:
         ace = _load_ace()
@@ -505,15 +541,16 @@ def cmd_candidates(args):
         BC.install_into(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting... ({fmt_duration(r)} left)"))
 
         if do_check:
-            say(f"Checking {len(cands)} candidate(s) against BRAIN platform...")
-            for c in cands:
+            check_list = [cands[candidate_number - 1]] if candidate_number is not None else cands
+            say(f"Checking {len(check_list)} candidate(s) against BRAIN platform...")
+            for c in check_list:
                 st, msg = E.check_candidate_platform(ace, s, c, store, cfg)
                 say(f"  {c.alpha_id}  sharpe={c.sharpe}  status={st}  ({msg})")
             store.close()
             return 0
 
         if do_submit:
-            cand = cands[0]
+            cand = cands[candidate_number - 1] if candidate_number is not None else cands[0]
             say(f"Submitting top candidate {cand.alpha_id} (sharpe={cand.sharpe}, fitness={cand.fitness})...")
             ok, msg = E.submit_candidate_now(ace, s, cfg, pack, store, cand)
             say(f"Result: {msg}")
@@ -732,6 +769,9 @@ def build_parser():
         sp.add_argument("--limit", type=int, default=25, help="max candidates to display (default: 25)")
         sp.add_argument("--check", action="store_true", help="re-check correlation and platform status on BRAIN")
         sp.add_argument("--submit", action="store_true", help="submit the top passing candidate in this field")
+        sp.add_argument("--candidate", type=int, default=None, help="1-based candidate number for a detail action")
+        sp.add_argument("--candidate-action", choices=("inspect", "check", "submit", "fail", "manual_active"), default=None)
+        sp.add_argument("--reason", default=None, help="reason used by candidate-action=fail")
         sp.add_argument("--min-sharpe", type=float, default=None, dest="min_sharpe", help="override min Sharpe cutoff")
         sp.add_argument("--min-fitness", type=float, default=None, dest="min_fitness", help="override min Fitness cutoff")
         sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")

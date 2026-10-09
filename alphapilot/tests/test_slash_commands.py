@@ -77,12 +77,10 @@ class SlashRegistryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(await terminal.execute(command))
                     called = handler.call_args.args[0]
                     self.assertEqual(called[2], target)
-            with patch("alphapilot.menu._quick_setup") as setup:
-                await terminal.execute("/setup")
-                setup.assert_called_once()
-            with patch("alphapilot.menu._settings_screen") as settings:
-                await terminal.execute("/settings")
-                settings.assert_called_once()
+            await terminal.execute("/setup")
+            self.assertEqual(terminal.context, "setup")
+            await terminal.execute("/settings")
+            self.assertEqual(terminal.context, "settings")
 
     async def test_jump_shows_effect_and_requires_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -182,6 +180,15 @@ class SlashRegistryTests(unittest.IsolatedAsyncioTestCase):
                 await terminal.execute("/settings ?")
             self.assertEqual(terminal.context, "main")
             self.assertIn("Settings", output.getvalue())
+
+    async def test_nested_option_uses_real_settings_handler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            terminal, output = self.terminal(Path(directory))
+            await terminal.execute("/settings")
+            await terminal.execute("/set llm.provider=template")
+            from alphapilot import config
+            self.assertEqual(config.load_config(Path(directory)).llm.provider, "template")
+            self.assertIn("Settings saved", output.getvalue())
 
 
 class ResetProtectionTests(unittest.TestCase):

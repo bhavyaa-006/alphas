@@ -20,8 +20,16 @@ def ensure_credentials(home) -> tuple:
     print("(if you expected one to be there already, you're likely running this from a "
           "different --home / working directory than last time - see USAGE.md)")
     print("BRAIN login (stored locally in", home / ".env", "- never sent anywhere but WorldQuant's API)")
-    email = input("Email: ").strip()
-    password = getpass.getpass("Password: ")
+    while True:
+        email = input("Email: ").strip()
+        if email != "?":
+            break
+        print("Enter the BRAIN account email address, or Ctrl+C to cancel.")
+    while True:
+        password = getpass.getpass("Password: ")
+        if password != "?":
+            break
+        print("Enter the BRAIN account password. It is stored in the selected home .env file.")
     set_dotenv_value(home / ".env", "BRAIN_CREDENTIAL_EMAIL", email)
     set_dotenv_value(home / ".env", "BRAIN_CREDENTIAL_PASSWORD", password)
     return email, password

@@ -22,7 +22,7 @@ from . import util
 SLASH_COMMANDS = {
     "/setup": ("Initialize, authenticate, and run diagnostics.", "/setup", "setup"),
     "/run": ("Run or resume simulations and the configured submission workflow.", "/run [--resume] [--simulate|--submit|--dry-run] [options]", "run"),
-    "/candidates": ("Review eligible alphas by field; optionally check or submit.", "/candidates [--eligible] [--field FIELD] [--check] [--submit]", "candidates"),
+    "/candidates": ("Review eligible alphas by field; optionally check or submit.", "/candidates [--eligible] [--field FIELD] [--limit N] [--check|--submit] [thresholds]", "candidates"),
     "/status": ("Show current pool counts, top alphas, and common errors.", "/status", "status"),
     "/fields": ("Show progress by field, optionally filtered to one field.", "/fields [--field FIELD]", "fields"),
     "/errors": ("Show recent error records and grouped diagnostics.", "/errors [--limit N]", "errors"),
@@ -43,40 +43,76 @@ CONTEXT_OPTIONS = {
     "main": (),
     "setup": (
         ("/execute", "Run initialization, login, and diagnostics.", "/setup", "setup"),
+        ("/init", "Create or repair the local configuration.", "/setup /init", "setup"),
+        ("/login", "Store BRAIN credentials using the existing secure prompt.", "/setup /login", "setup"),
+        ("/doctor", "Run setup diagnostics.", "/setup /doctor", "setup"),
         ("/back", "Return to the main command context.", "/back", "back"),
     ),
     "run": (
+        ("/execute", "Run using the configured mode from the current checkpoint.", "/run --resume", "run"),
         ("/simulate", "Run simulation only.", "/run --simulate", "run"),
         ("/submit", "Run with the configured submission safeguards.", "/run --submit", "run"),
         ("/resume", "Resume from the existing checkpoint.", "/run --resume", "run"),
         ("/dry-run", "Simulate and preview submissions without sending them.", "/run --dry-run", "run"),
+        ("/mode", "Choose configured, simulate, submit, or dry-run execution mode.", "/run /mode MODE", "run"),
+        ("/focus", "Set a field/combo focus for this run.", "/run /focus FIELD[,FIELD...]", "run"),
+        ("/stop-after", "Set the per-run submission limit.", "/run /stop-after N", "run"),
         ("/back", "Return to the main command context.", "/back", "back"),
     ),
     "candidates": (
-        ("/review", "Review candidates using the normal eligibility rules.", "/candidates", "candidates"),
+        ("/review", "Review eligible candidates using the normal checks.", "/candidates --eligible", "candidates"),
         ("/eligible", "List eligible candidates.", "/candidates --eligible", "candidates"),
         ("/submit", "Submit eligible candidates after the existing checks.", "/candidates --eligible --submit", "candidates"),
+        ("/check", "Re-check candidate platform status and correlation.", "/candidates --check", "candidates"),
+        ("/field", "Filter candidates to one field or combo.", "/candidates /field FIELD", "candidates"),
+        ("/limit", "Set the maximum number of candidates displayed.", "/candidates /limit N", "candidates"),
+        ("/min-sharpe", "Override the minimum Sharpe cutoff.", "/candidates /min-sharpe VALUE", "candidates"),
+        ("/min-fitness", "Override the minimum Fitness cutoff.", "/candidates /min-fitness VALUE", "candidates"),
+        ("/inspect", "Inspect a candidate by its displayed position.", "/candidates /inspect N", "candidates"),
+        ("/fail", "Mark a candidate as a check failure.", "/candidates /fail N [REASON]", "candidates"),
+        ("/manual-active", "Mark a candidate as submitted outside AlphaPilot.", "/candidates /manual-active N", "candidates"),
         ("/back", "Return to the main command context.", "/back", "back"),
     ),
     "status": (("/back", "Return to the main command context.", "/back", "back"),),
-    "fields": (("/back", "Return to the main command context.", "/back", "back"),),
-    "errors": (("/back", "Return to the main command context.", "/back", "back"),),
+    "fields": (
+        ("/field", "Filter progress to one field or combo.", "/fields /field FIELD", "fields"),
+        ("/back", "Return to the main command context.", "/back", "back"),
+    ),
+    "errors": (
+        ("/limit", "Limit the number of recent error rows displayed.", "/errors /limit N", "errors"),
+        ("/back", "Return to the main command context.", "/back", "back"),
+    ),
     "retry": (
         ("/retry", "Retry all failed simulations using existing retry rules.", "/retry", "retry"),
         ("/dry-run", "Preview how many failures would be retried.", "/retry --dry-run", "retry"),
+        ("/filter", "Retry only errors matching a case-insensitive substring.", "/retry /filter TEXT", "retry"),
+        ("/reset-attempts", "Reset retry counters while retrying failures.", "/retry --reset-attempts", "retry"),
         ("/back", "Return to the main command context.", "/back", "back"),
     ),
     "history": (("/back", "Return to the main command context.", "/back", "back"),),
     "jump": (
         ("/restore", "Restore skipped work to pending.", "/jump 0", "jump"),
+        ("/position", "Skip to a validated 1-based alpha position.", "/jump /position N", "jump"),
         ("/back", "Return to the main command context.", "/back", "back"),
     ),
     "settings": (
-        ("/show", "Display current settings without revealing secrets.", "/settings", "settings"),
+        ("/show", "Display current settings without revealing secrets.", "/settings --show", "settings"),
         ("/set", "Change a validated setting using key.path=value.", "/settings key.path=value", "settings"),
+        ("/pack", "Choose the active dataset pack.", "/settings /pack PACK", "settings"),
+        ("/submit-mode", "Set submit.mode to off, ask, auto, or dry.", "/settings /submit-mode off|dry|ask|auto", "settings"),
+        ("/max-per-day", "Set the daily submission limit.", "/settings /max-per-day N", "settings"),
+        ("/max-per-run", "Set the per-run submission limit.", "/settings /max-per-run N", "settings"),
+        ("/polling", "Enable or disable submission polling output.", "/settings /polling on|off", "settings"),
+        ("/focus", "Set saved field focus, or clear it.", "/settings /focus FIELD[,FIELD...]", "settings"),
+        ("/provider", "Set the optional LLM provider (openrouter|mistral|openai|ollama|custom|template|none).", "/settings /provider PROVIDER", "settings"),
+        ("/metadata-mode", "Set metadata mode to template or ai.", "/settings /metadata-mode template|ai", "settings"),
+        ("/edit", "Open the existing config.yaml editing workflow.", "/settings /edit", "settings"),
         ("/back", "Return to the main command context.", "/back", "back"),
     ),
-    "doctor": (("/back", "Return to the main command context.", "/back", "back"),),
+    "doctor": (
+        ("/check-model", "Check the optional AI metadata provider.", "/doctor --check-model", "doctor"),
+        ("/back", "Return to the main command context.", "/back", "back"),
+    ),
     "reset": (
         ("/preview", "Show reset scope without changing progress.", "/reset --preview", "reset"),
         ("/confirm", "Clear local progress after confirmation.", "/reset", "reset"),
@@ -86,7 +122,7 @@ CONTEXT_OPTIONS = {
 }
 
 
-def context_reference(context: str = "main") -> str:
+def context_reference(context: str = "main", home: Path | None = None) -> str:
     """Render the active context from the same definitions used for dispatch."""
     if context == "main":
         return command_reference()
@@ -94,6 +130,20 @@ def context_reference(context: str = "main") -> str:
     lines = [title, "─" * max(12, len(title)), "", "Available options", ""]
     for name, description, usage, _route in CONTEXT_OPTIONS.get(context, ()):
         lines.extend((f"  {name:<12} {description}", f"               Usage: {usage}"))
+    if home is not None and context in {"settings", "fields", "candidates", "run"}:
+        try:
+            from . import cli as _cli, config as _cfg, packs_api as _packs
+            cfg = _cfg.load_config(home)
+            pack = _packs.resolve_pack(cfg.pack, _cli._pack_dirs(Path(_cli.__file__).resolve(), home))
+            if context in {"fields", "candidates", "run"}:
+                lines.extend(("", "Available field values: " + ", ".join((*pack.field_ids(), "combo"))))
+            if context == "settings":
+                infos = _packs.list_pack_infos(_cli._pack_dirs(Path(_cli.__file__).resolve(), home))
+                choices = [info.key for info in infos if not info.error and not info.shadowed_by]
+                if choices:
+                    lines.extend(("", "Available pack values: " + ", ".join(choices)))
+        except Exception:
+            pass
     lines.extend(("", "Type ? to show these options. Type /back to return to the main context."))
     return "\n".join(lines)
 
@@ -412,7 +462,7 @@ class CommandTerminal:
             self.console.print(command_reference(), markup=False)
             return False
         if raw == "?":
-            self.console.print(context_reference(self.context), markup=False)
+            self.console.print(context_reference(self.context, self.home), markup=False)
             return False
         try:
             argv = shlex.split(raw)
@@ -421,22 +471,95 @@ class CommandTerminal:
             return False
         command = argv[0].lower() if argv else ""
         if len(argv) == 2 and argv[1] == "?" and command in self.SLASH:
-            self.console.print(context_reference(self.SLASH[command][2]), markup=False)
+            self.console.print(context_reference(self.SLASH[command][2], self.home), markup=False)
             return False
         if self.context != "main" and command == "/back":
             self.context = self.context_stack.pop() if self.context_stack else "main"
-            self.console.print(context_reference(self.context), markup=False)
+            self.console.print(context_reference(self.context, self.home), markup=False)
             return False
         if self.context != "main" and command in {name for name, *_ in CONTEXT_OPTIONS.get(self.context, ())}:
             option = next(item for item in CONTEXT_OPTIONS[self.context] if item[0] == command)
             _name, _description, usage, route = option
             if route == "back":
                 self.context = self.context_stack.pop() if self.context_stack else "main"
-                self.console.print(context_reference(self.context), markup=False)
+                self.console.print(context_reference(self.context, self.home), markup=False)
                 return False
+            if self.context == "setup" and command == "/execute":
+                from . import menu
+                menu._quick_setup(self.home)
+                return False
+            if self.context == "run" and command == "/execute":
+                return await self.execute("/run --resume")
+            if self.context == "settings" and command == "/show":
+                return self._settings(["--show"])
+            if self.context == "reset" and command == "/confirm":
+                return self._cli("reset", [])
+            supplied = argv[1:]
+            if self.context == "setup":
+                if command == "/init":
+                    return self._cli("init", supplied)
+                if command == "/login":
+                    return self._cli("login", supplied)
+                if command == "/doctor":
+                    return self._cli("doctor", supplied)
+            if self.context == "run":
+                if command == "/mode":
+                    modes = {"simulate": "--simulate", "submit": "--submit", "dry-run": "--dry-run", "dry": "--dry-run"}
+                    if not supplied or supplied[0] not in modes:
+                        return self._missing_value(usage + " (MODE: simulate|submit|dry-run)")
+                    return await self.execute("/run " + modes[supplied[0]])
+                if command == "/focus":
+                    return await self.execute("/run --focus " + " ".join(supplied)) if supplied else self._missing_value(usage)
+                if command == "/stop-after":
+                    return await self.execute("/run --stop-after " + " ".join(supplied)) if supplied else self._missing_value(usage)
+            if self.context == "fields" and command == "/field":
+                return self._cli("fields", ["--field", *supplied]) if supplied else self._missing_value(usage)
+            if self.context == "errors" and command == "/limit":
+                return self._cli("errors", ["--limit", *supplied]) if supplied else self._missing_value(usage)
+            if self.context == "jump" and command == "/position":
+                return await self.execute("/jump " + " ".join(supplied)) if supplied else self._missing_value(usage)
+            if self.context == "retry":
+                if command == "/filter":
+                    return self._cli("retry-errors", ["--filter", *supplied]) if supplied else self._missing_value(usage)
+                if command == "/reset-attempts":
+                    return self._cli("retry-errors", ["--reset-attempts"])
+            if self.context == "settings":
+                setting_args = {
+                    "/pack": "pack=",
+                    "/submit-mode": "submit.mode=",
+                    "/max-per-day": "submit.max_per_day=",
+                    "/max-per-run": "submit.max_per_run=",
+                    "/polling": "submit.show_polling=",
+                    "/focus": "run.focus=",
+                    "/provider": "llm.provider=",
+                    "/metadata-mode": "llm.metadata_mode=",
+                }
+                if command in setting_args:
+                    return self._settings([setting_args[command] + " ".join(supplied)]) if supplied else self._missing_value(usage)
+                if command == "/edit":
+                    return self._settings(["--edit"])
+            if self.context == "candidates":
+                flags = {
+                    "/field": "--field", "/limit": "--limit", "/min-sharpe": "--min-sharpe",
+                    "/min-fitness": "--min-fitness",
+                }
+                if command in flags:
+                    return self._cli("candidates", [flags[command], *supplied]) if supplied else self._missing_value(usage)
+                if command == "/check":
+                    return self._cli("candidates", (["--check", "--candidate", supplied[0], "--candidate-action", "check"] if supplied else ["--check"]))
+                if command == "/submit":
+                    return self._cli("candidates", (["--eligible", "--submit", "--candidate", supplied[0], "--candidate-action", "submit"] if supplied else ["--eligible", "--submit"]))
+                if command == "/eligible":
+                    return self._cli("candidates", ["--eligible"])
+                if command in ("/inspect", "/fail", "/manual-active"):
+                    if not supplied:
+                        return self._missing_value(usage)
+                    action = {"/inspect": "inspect", "/fail": "fail", "/manual-active": "manual_active"}[command]
+                    args = ["--eligible", "--candidate", supplied[0], "--candidate-action", action]
+                    if command == "/fail" and len(supplied) > 1:
+                        args.extend(("--reason", " ".join(supplied[1:])))
+                    return self._cli("candidates", args)
             nested_args = shlex.split(usage)[1:]
-            if route == "setup":
-                return await self.execute("/setup")
             return await self.execute("/" + route + (" " + " ".join(nested_args) if nested_args else ""))
         if command not in self.SLASH:
             self.console.print(f"[yellow]Unknown command {command!r}. Type ? for the 13 supported commands.[/yellow]")
@@ -454,6 +577,9 @@ class CommandTerminal:
         # invocation semantics for the command itself.
         self.context_stack = ["main"]
         self.context = route
+        if not arguments and route in {"setup", "run", "candidates", "settings", "reset"}:
+            self.console.print(context_reference(route, self.home), markup=False)
+            return False
         self.console.print(f"[cyan]›[/cyan] {raw}")
         try:
             if route == "setup":
@@ -485,14 +611,33 @@ class CommandTerminal:
             self.console.print(f"[red]Command exited with status {code}.[/red]")
         return False
 
+    def _missing_value(self, usage: str) -> bool:
+        self.console.print(f"A value is required. Usage: {usage}\nType ? to see this context again.")
+        return False
+
     def _run(self, arguments: list[str]) -> bool:
         return self._cli("run", arguments)
 
     def _settings(self, arguments: list[str]) -> bool:
         from . import config as C
+        if arguments == ["--edit"]:
+            self.console.print(f"Edit this file, then return to the CLI: {C.config_path(self.home)}")
+            return False
+        if arguments == ["--show"]:
+            cfg = C.load_config(self.home)
+            self.console.print(
+                f"pack={cfg.pack}\n"
+                f"simulation: pool_size={cfg.simulation.pool_size} batch_size={cfg.simulation.batch_size} "
+                f"error_streak_halt={cfg.simulation.error_streak_halt}\n"
+                f"submit: mode={cfg.submit.mode} max_per_day={cfg.submit.max_per_day} "
+                f"max_per_run={cfg.submit.max_per_run} show_polling={cfg.submit.show_polling}\n"
+                f"saved focus: {cfg['run'].get('focus') or '(none - whole pool)'}\n"
+                f"llm: provider={cfg.llm.provider} metadata_mode={cfg.llm.metadata_mode} "
+                f"model={cfg.llm.model or '(default)'}"
+            )
+            return False
         if not arguments:
-            from . import menu
-            menu._settings_screen(self.home)
+            self.console.print(context_reference("settings", self.home), markup=False)
             return False
         cfg = dict(C.load_config(self.home))
         try:
@@ -547,7 +692,7 @@ class CommandTerminal:
             while True:
                 answer = input("Proceed? [y/N] ").strip().lower()
                 if answer == "?":
-                    self.console.print(context_reference("jump"), markup=False)
+                    self.console.print(context_reference("jump", self.home), markup=False)
                     continue
                 if answer != "y":
                     self.console.print("Cancelled; progress was not changed.")
