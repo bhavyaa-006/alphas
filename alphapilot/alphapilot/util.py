@@ -8,10 +8,21 @@ import logging.handlers
 import os
 import re
 import sys
+import contextvars
 from datetime import datetime, timezone
 from pathlib import Path
 
 LOGGER = logging.getLogger("alphapilot")
+_OUTPUT_HANDLER = contextvars.ContextVar("alphapilot_output_handler", default=None)
+
+
+def set_output_handler(handler):
+    """Route business-layer progress to an interactive renderer when installed."""
+    return _OUTPUT_HANDLER.set(handler)
+
+
+def reset_output_handler(token):
+    _OUTPUT_HANDLER.reset(token)
 
 
 class Theme:
@@ -206,6 +217,11 @@ def say(msg: str = "", level: int = logging.INFO, stamp: bool = True) -> None:
             if msg.lstrip().startswith(prefix):
                 text = msg.replace(prefix, Theme.paint(prefix, role), 1)
                 break
+    handler = _OUTPUT_HANDLER.get()
+    if handler is not None:
+        handler(msg)
+        LOGGER.log(level, msg)
+        return
     print(text, flush=True)
     LOGGER.log(level, msg)
 
@@ -213,6 +229,11 @@ def say(msg: str = "", level: int = logging.INFO, stamp: bool = True) -> None:
 def banner(lines, char: str = "=") -> None:
     """Render a compact, width-aware section heading without an oversized box."""
     if not lines:
+        return
+    handler = _OUTPUT_HANDLER.get()
+    if handler is not None:
+        handler(" | ".join(lines))
+        LOGGER.info("BANNER: %s", " | ".join(lines))
         return
     title, *details = lines
     print(flush=True)

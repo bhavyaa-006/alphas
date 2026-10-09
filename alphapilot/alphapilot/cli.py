@@ -7,7 +7,6 @@ from pathlib import Path
 
 from . import config as C
 from . import engine as E
-from . import llm as LLM
 from . import packs_api as P
 from . import secrets as SEC
 from . import state as ST
@@ -19,6 +18,15 @@ def _pack_dirs(here: Path, home: Path):
     # here = .../alphapilot/alphapilot/cli.py -> repo root is two levels up
     repo_root = here.parent.parent
     return [home / "packs", repo_root / "packs"]
+
+
+def _load_ace():
+    """Load the bundled WorldQuant client without requiring a manual PYTHONPATH."""
+    import importlib
+    vendor = Path(__file__).resolve().parent.parent / "ACE_API__Gold_"
+    if vendor.is_dir() and str(vendor) not in sys.path:
+        sys.path.insert(0, str(vendor))
+    return importlib.import_module("ace_lib")
 
 
 def _state_db_path(home: Path, pack_key: str) -> Path:
@@ -128,7 +136,7 @@ def cmd_packs(args):
 
 
 def cmd_doctor(args):
-    import ace_lib as ace
+    ace = _load_ace()
 
     home = _resolve_home(args)
     cfg = C.load_config(home, args.set)
@@ -176,9 +184,13 @@ def cmd_doctor(args):
     else:
         say(f"   OK  all {len(pack.allowed_operators)} pack operators are available")
 
-    say("5. checking LLM description provider ...")
-    res = LLM.preflight(cfg)
-    say(("   OK  " if res["ok"] else "   !! ") + f"{res['provider']}: {res['detail']}")
+    if getattr(args, "check_model", False):
+        from . import llm as LLM
+        say("5. checking optional AI metadata provider ...")
+        res = LLM.preflight(cfg)
+        say(("   OK  " if res["ok"] else "   !! ") + f"{res['provider']}: {res['detail']}")
+    else:
+        say("5. optional AI metadata provider check skipped (use --check-model to test it)")
 
     say("6. smoke-testing one simulation ...")
     expr = min(pack.build(cfg.simulation.seed, cfg.simulation.pool_size), key=len)
@@ -200,10 +212,20 @@ def _resolve_home(args):
 
 
 def cmd_run(args):
-    import ace_lib as ace
+    ace = _load_ace()
 
+    cancel_event = getattr(args, "cancel_event", None)
     home = _resolve_home(args)
-    cfg = C.load_config(home, args.set)
+    overrides = list(getattr(args, "set", []))
+    run_mode = getattr(args, "run_mode", None)
+    if run_mode == "simulate":
+        overrides.append("submit.mode=off")
+    elif run_mode == "submit":
+        # Explicit submission requests still require the existing per-alpha confirmation.
+        overrides.append("submit.mode=ask")
+    elif run_mode == "dry-run":
+        overrides.append("submit.mode=dry")
+    cfg = C.load_config(home, overrides)
     # one-off overrides from the CLI flags / menu (not saved to config.yaml)
     if getattr(args, "focus", None) is not None:
         cfg["run"]["focus"] = P.normalize_focus(args.focus)
@@ -245,8 +267,16 @@ def cmd_run(args):
         store.close()
         return 0
 
-    s = BC.ensure_session(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting for face check... ({fmt_duration(r)} left)"))
-    BC.install_into(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting... ({fmt_duration(r)} left)"))
+    try:
+        s = BC.ensure_session(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting for face check... ({fmt_duration(r)} left)"), cancel_event=cancel_event)
+        BC.install_into(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting... ({fmt_duration(r)} left)"), cancel_event=cancel_event)
+    except BC.SessionCancelled:
+        store.close()
+        say("Cancelled during BRAIN authentication.")
+        return 130
+    except Exception:
+        store.close()
+        raise
 
     def ask_fn(cand, meta):
         print(f"\nSubmit {cand.alpha_id}? sharpe={cand.sharpe} fitness={cand.fitness}")
@@ -276,14 +306,25 @@ def cmd_run(args):
 
     batches_since_submit_check = 0
     total_batches_run = 0
+    max_batches = getattr(args, "max_batches", None)
     try:
-        while not store.is_done(focus):
+        say("Connecting to BRAIN…")
+        while not store.is_done(focus) and (max_batches is None or total_batches_run < max_batches):
+            if cancel_event is not None and cancel_event.is_set():
+                raise E.EngineCancelled()
             total_batches_run += 1
             _batch_num = total_batches_run  # capture now; default arg avoids late-binding closure bug
             def on_progress(rs, counts, _n=_batch_num):
-                say(f"batch {_n}: ok={rs.simulated_ok} err={rs.simulated_err}  |  pool: {counts}")
+                total = len(pool)
+                completed = max(0, total - counts.get("pending", 0) - counts.get("simulating", 0))
+                pct = min(100, int(completed * 100 / total)) if total else 100
+                ok = counts.get("simulated", 0) + counts.get("submitted", 0)
+                err = counts.get("error", 0)
+                pending = counts.get("pending", 0)
+                say(f"Batch {_n} complete | {ok} successful | {err} failed | {pending} pending | {pct}%")
 
-            E.run_simulation_batches(ace, s, cfg, pack, store, on_progress=on_progress, max_batches=1, focus=focus)
+            E.run_simulation_batches(ace, s, cfg, pack, store, on_progress=on_progress, max_batches=1,
+                                     focus=focus, cancel_event=cancel_event)
             batches_since_submit_check += 1
             if batches_since_submit_check >= cfg.submit.cycle_every_batches:
                 batches_since_submit_check = 0
@@ -295,9 +336,13 @@ def cmd_run(args):
             do_cycle()
     except E.EngineHalt as e:
         say(f"\nHALTED: {e}")
+        say("Progress is saved. Review `alphapilot status` and `alphapilot retry-errors` before resuming.")
         return 2
     except KeyboardInterrupt:
-        say("\nInterrupted - progress is saved. Re-run `alphapilot run` to continue.")
+        say("\nCancelled - progress is saved. Run `alphapilot run` to continue.")
+        return 130
+    except E.EngineCancelled:
+        say("\nCancelled - unfinished expressions returned to pending; progress is saved.")
         return 130
     finally:
         final_counts = store.counts()
@@ -322,7 +367,14 @@ def cmd_fields(args):
         store.close()
     print(f"pack: {pack.name}")
     print(f"  {'field / group':<32} pending  simulated  submitted  error")
-    for name in [*pack.field_ids(), "combo"]:
+    field_filter = getattr(args, "field", None)
+    names = [*pack.field_ids(), "combo"]
+    if field_filter:
+        if field_filter not in names:
+            print(f"Unknown field {field_filter!r}. Choose from: {', '.join(names)}")
+            return 2
+        names = [field_filter]
+    for name in names:
         c = counts[name]
         label = name if name != "combo" else "combo (2+ fields mixed)"
         print(f"  {label:<32} {c['pending']:>7}  {c['simulated']:>9}  {c['submitted']:>9}  {c['error']:>5}")
@@ -348,6 +400,31 @@ def cmd_status(args):
         for row in errs:
             print(f"  x{row['count']:<4} {row['example'][:100]}")
     store.close()
+
+
+def cmd_errors(args):
+    """Display recent error records and grouped diagnostics for this pack."""
+    home = _resolve_home(args)
+    cfg = C.load_config(home, getattr(args, "set", []))
+    db = _state_db_for(home, cfg)
+    if not db.exists():
+        print(f"No progress or errors recorded for pack {cfg.pack!r}.")
+        return 0
+    store = ST.Store(db)
+    try:
+        rows = store.recent_errors(getattr(args, "limit", 20))
+        if not rows:
+            print(f"No errors recorded for pack {cfg.pack!r}.")
+            return 0
+        print(f"Recent errors for {cfg.pack!r}:")
+        for row in rows:
+            print(f"  {row['updated_at']}  attempts={row['attempts']}  {row['expr'][:90]}\n    {row['error']}")
+        print("\nGrouped summary:")
+        for row in store.error_summary(10):
+            print(f"  x{row['count']:<4} {row['example'][:200]}")
+    finally:
+        store.close()
+    return 0
 
 
 def cmd_submissions(args):
@@ -384,6 +461,8 @@ def cmd_candidates(args):
         return 1
 
     field = getattr(args, "field", None)
+    if getattr(args, "eligible", False) and not field:
+        field = "all"
     min_sharpe = getattr(args, "min_sharpe", None)
     if min_sharpe is None:
         min_sharpe = cfg.submit.min_sharpe
@@ -421,7 +500,7 @@ def cmd_candidates(args):
     do_submit = getattr(args, "submit", False)
 
     if do_check or do_submit:
-        import ace_lib as ace
+        ace = _load_ace()
         s = BC.ensure_session(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting... ({fmt_duration(r)} left)"))
         BC.install_into(ace, cfg, home, on_persona_link=lambda u: say(f"Face check needed: {u}"), on_waiting=lambda a, r: say(f"waiting... ({fmt_duration(r)} left)"))
 
@@ -454,16 +533,42 @@ def cmd_reset(args):
     home = _resolve_home(args)
     cfg = C.load_config(home, getattr(args, "set", []))
     db = _state_db_for(home, cfg)
-    if not args.yes:
-        if input(f"Delete {db}? This forgets all simulation/submission progress for pack {cfg.pack!r} "
-                 f"(does NOT touch anything already submitted to BRAIN). [y/N] ").strip().lower() != "y":
-            print("cancelled")
-            return 0
-    for suffix in ("", "-wal", "-shm"):
-        p = Path(str(db) + suffix)
-        if p.exists():
-            p.unlink()
-    print("state cleared:", db)
+    if not db.exists():
+        print(f"No progress database exists for pack {cfg.pack!r}; nothing to reset.")
+        return 0
+    if getattr(args, "preview", False):
+        store = ST.Store(db)
+        try:
+            counts = store.counts()
+            history = store.conn.execute("SELECT COUNT(*) FROM submissions").fetchone()[0]
+        finally:
+            store.close()
+        print(f"Reset preview for {cfg.pack!r}: would clear pending, simulated, and error rows; "
+              f"retain {counts.get('submitted', 0)} submitted row(s) and {history} history record(s).")
+        return 0
+    if not getattr(args, "yes", False):
+        while True:
+            answer = input(
+                f"Clear pending/simulated/error progress for pack {cfg.pack!r}? "
+                "Submitted alphas and submission history will be retained. [y/N] "
+            ).strip().lower()
+            if answer == "?":
+                print("Reset options: /reset --preview to inspect scope, /reset to confirm, /back to cancel.")
+                continue
+            if answer != "y":
+                print("cancelled")
+                return 0
+            break
+    store = ST.Store(db)
+    try:
+        cleared = store.reset_progress()
+        submitted = store.counts().get("submitted", 0)
+        history = store.conn.execute("SELECT COUNT(*) FROM submissions").fetchone()[0]
+    finally:
+        store.close()
+    print(f"Reset {cleared} local progress row(s) for {cfg.pack!r}; retained {submitted} submitted row(s) and {history} history record(s).")
+    print("Configuration, credentials, and other packs were not changed.")
+    return 0
 
 
 def cmd_retry(args):
@@ -482,6 +587,16 @@ def cmd_retry(args):
         store.close()
         return 0
     pattern = args.filter or ""
+    if getattr(args, "dry_run", False):
+        where = "status='error'"
+        params = []
+        if pattern:
+            where += " AND instr(lower(error), lower(?))"
+            params.append(pattern)
+        n = store.conn.execute(f"SELECT COUNT(*) FROM alphas WHERE {where}", params).fetchone()[0]
+        store.close()
+        print(f"Dry run: {n} errored expression(s) would be reset to pending{f' matching {pattern!r}' if pattern else ''}.")
+        return 0
     n = store.retry_errors(pattern=pattern, reset_attempts=args.reset_attempts)
     store.close()
     if n == 0:
@@ -499,8 +614,21 @@ def cmd_retry(args):
 
 
 def cmd_menu(args):
-    from . import menu
+    from . import agent_cli
 
+    return agent_cli.main(args.home)
+
+
+def cmd_chat(args):
+    """Optional free-form AI chat; the standard CLI never starts this implicitly."""
+    from . import agent_cli
+
+    return agent_cli.chat_main(args.home)
+
+
+def cmd_legacy_menu(args):
+    """Compatibility entrypoint for the former numbered workflow menu."""
+    from . import menu
     return menu.main_menu(args.home)
 
 
@@ -534,12 +662,18 @@ def cmd_jump(args):
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="alphapilot", description="Resumable WorldQuant BRAIN alpha automation.")
+    p = argparse.ArgumentParser(prog="alphapilot", description="Deterministic CLI and resumable WorldQuant BRAIN alpha workflow; optional AI chat is available with `chat`.")
     p.add_argument("--home", default=None, help="state directory (default: $ALPHAPILOT_HOME or ./data)")
     sub = p.add_subparsers(dest="cmd")
 
-    sp = sub.add_parser("menu", help="interactive menu (default when run with no command)")
+    sp = sub.add_parser("menu", help="interactive deterministic command shell (default when run with no command)")
     sp.set_defaults(func=cmd_menu)
+
+    sp = sub.add_parser("chat", help="optional AI research chat (requires a configured chat model)")
+    sp.set_defaults(func=cmd_chat)
+
+    sp = sub.add_parser("legacy-menu", help="open the original numbered workflow menu")
+    sp.set_defaults(func=cmd_legacy_menu)
 
     sp = sub.add_parser("init", help="create the home directory and a default config.yaml")
     sp.set_defaults(func=cmd_init)
@@ -551,8 +685,9 @@ def build_parser():
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_packs)
 
-    sp = sub.add_parser("doctor", help="verify session, fields, operators, LLM, and run one smoke-test simulation")
+    sp = sub.add_parser("doctor", help="verify session, fields, operators, and run one smoke-test simulation")
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
+    sp.add_argument("--check-model", action="store_true", help="also check the optional AI metadata provider")
     sp.set_defaults(func=cmd_doctor)
 
     sp = sub.add_parser("run", help="simulate the pool and (per submit.mode) submit alphas - resumable")
@@ -562,10 +697,19 @@ def build_parser():
                          "e.g. --focus oth176_eq_medium,oth176_malta_eq_score,combo")
     sp.add_argument("--stop-after", type=int, default=None, dest="stop_after",
                     help="stop the whole run after this many submissions (0 = no limit)")
+    sp.add_argument("--resume", action="store_true", help="resume saved progress (the default run behavior)")
+    run_modes = sp.add_mutually_exclusive_group()
+    run_modes.add_argument("--simulate", action="store_const", const="simulate", dest="run_mode",
+                           help="simulate only; do not submit")
+    run_modes.add_argument("--submit", action="store_const", const="submit", dest="run_mode",
+                           help="simulate and ask before each eligible submission")
+    run_modes.add_argument("--dry-run", action="store_const", const="dry-run", dest="run_mode",
+                           help="simulate and report what would be submitted")
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("fields", help="per-field progress (pending / simulated / submitted) to help pick a focus")
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
+    sp.add_argument("--field", default=None, help="show only this field or combo")
     sp.set_defaults(func=cmd_fields)
 
     sp = sub.add_parser("status", help="show progress: counts, top alphas, recent errors")
@@ -576,9 +720,15 @@ def build_parser():
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_submissions)
 
+    sp = sub.add_parser("errors", help="show recent error records and grouped error diagnostics")
+    sp.add_argument("--limit", type=int, default=20, help="maximum recent error records")
+    sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
+    sp.set_defaults(func=cmd_errors)
+
     for cmd_alias in ("candidates", "review"):
         sp = sub.add_parser(cmd_alias, help="review eligible candidates by field, check status, or submit")
         sp.add_argument("--field", default=None, help="field name or 'combo' to list (default: summary of all fields)")
+        sp.add_argument("--eligible", action="store_true", help="list eligible candidates across fields")
         sp.add_argument("--limit", type=int, default=25, help="max candidates to display (default: 25)")
         sp.add_argument("--check", action="store_true", help="re-check correlation and platform status on BRAIN")
         sp.add_argument("--submit", action="store_true", help="submit the top passing candidate in this field")
@@ -592,8 +742,9 @@ def build_parser():
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_jump)
 
-    sp = sub.add_parser("reset", help="wipe local progress (does NOT touch anything already submitted to BRAIN)")
+    sp = sub.add_parser("reset", help="clear local simulation progress while retaining submitted records and history")
     sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--preview", action="store_true", help="show reset scope without changing progress")
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_reset)
 
@@ -612,6 +763,7 @@ def build_parser():
         help="also zero the attempt counter so each expression gets the full max_attempts budget again "
              "(by default the existing count is kept)",
     )
+    sp.add_argument("--dry-run", action="store_true", dest="dry_run", help="count matching errors without changing state")
     sp.add_argument("--set", action="append", default=[], help="override config, e.g. --set pack=my_pack")
     sp.set_defaults(func=cmd_retry)
 
@@ -622,6 +774,12 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
+        # A bare invocation is an interactive entrypoint only when a terminal
+        # is available.  In scripts/pipes, print the command reference rather
+        # than starting a prompt that cannot receive input.
+        if not sys.stdin.isatty():
+            parser.print_help()
+            return 0
         args.func = cmd_menu
     try:
         return args.func(args) or 0
@@ -634,6 +792,9 @@ def main(argv=None):
     except BC.BrainError as e:
         mark = Theme.symbol("✕", "x")
         print(f"{Theme.paint(mark + ' BRAIN error', 'error')}\n  {e}", file=sys.stderr)
+        return 1
+    except (OSError, TimeoutError) as e:
+        print(f"{Theme.paint('✕ Connection problem', 'error')}\n  {e}\n  Check the network and API configuration, then retry.", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(f"{Theme.paint('! Operation cancelled', 'warning')}", file=sys.stderr)

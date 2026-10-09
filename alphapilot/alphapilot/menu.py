@@ -4,6 +4,7 @@ directly for scripting/Docker/cron use - this menu just calls the same
 functions."""
 from __future__ import annotations
 
+import asyncio
 import argparse
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from . import cli as C
 from . import config as CFG
 from . import packs_api as PA
 from . import state as ST
+from . import terminal as T
 from .util import banner, say
 
 
@@ -22,17 +24,19 @@ def _args(home, **extra):
 
 
 def _pause():
-    input("\nPress Enter to return to the menu... ")
+    T.prompt("\nPress Enter to return to the menu... ")
 
 
-def _prompt_choice(title, options, allow_back=True):
+def _prompt_choice(title, options, allow_back=True, history_file=None, record=False):
     print(f"\n{title}")
     for i, (label, _) in enumerate(options, 1):
         print(f"  {i}) {label}")
     if allow_back:
         print("  0) Back")
     while True:
-        raw = input("> ").strip()
+        raw = T.prompt("> ", history_file=history_file, record=record).strip()
+        if record and (raw.startswith("/") or raw == "?"):
+            return raw
         if allow_back and raw == "0":
             return None
         if raw.isdigit() and 1 <= int(raw) <= len(options):
@@ -72,7 +76,7 @@ def _pick_focus(home: Path, cfg):
     else:
         print("Press Enter for everything.")
     while True:
-        raw = input("> ").strip()
+        raw = T.prompt("› ").strip()
         if raw == "":
             return saved, False
         if raw == "0":
@@ -98,7 +102,7 @@ def _run_screen(home: Path):
         _pause()
         return
 
-    raw = input(f"\nStop the run after how many submissions? [Enter = {cfg.submit.max_per_run}, 0 = no limit]: ").strip()
+    raw = T.prompt(f"\nStop after how many submissions? [Enter = {cfg.submit.max_per_run}, 0 = no limit]: ").strip()
     stop_after = int(raw) if raw.isdigit() else int(cfg.submit.max_per_run)
 
     choice = _prompt_choice("Run with...", [
@@ -113,7 +117,7 @@ def _run_screen(home: Path):
     overrides = [] if choice == "asis" else [f"submit.mode={choice}"]
     mode = cfg.submit.mode if choice == "asis" else choice
     if mode in ("ask", "auto") and stop_after > int(cfg.submit.max_per_day):
-        yn = input(f"submit.max_per_day is {cfg.submit.max_per_day}, so the run would stop at that many per day. "
+        yn = T.prompt(f"submit.max_per_day is {cfg.submit.max_per_day}, so the run would stop at that many per day. "
                    f"Raise it to {stop_after} for this run? [y/N] ").strip().lower()
         if yn == "y":
             overrides.append(f"submit.max_per_day={stop_after}")
@@ -182,12 +186,12 @@ def _retry_screen(home: Path):
         return
     pattern = ""
     if choice == "filter":
-        pattern = input("  Filter text (case-insensitive substring of error message): ").strip()
+        pattern = T.prompt("  Filter text (case-insensitive substring of error message): ").strip()
         if not pattern:
             print("  No filter entered, cancelling.")
             _pause()
             return
-    reset_att = input("  Also reset attempt counters? This gives each expression the full retry budget again. [y/N] ").strip().lower() == "y"
+    reset_att = T.prompt("  Also reset attempt counters? This gives each expression the full retry budget again. [y/N] ").strip().lower() == "y"
     store = ST.Store(db)
     n = store.retry_errors(pattern=pattern, reset_attempts=reset_att)
     store.close()
@@ -225,7 +229,7 @@ def _candidates_screen(home: Path):
 
     def get_session():
         if session_holder["s"] is None:
-            import ace_lib as ace
+            ace = C._load_ace()
             say("Connecting session to BRAIN...")
             s = C.BC.ensure_session(
                 ace, cfg, home,
@@ -261,7 +265,7 @@ def _candidates_screen(home: Path):
             print(f"   0) {'All fields':<32}{tot['total']:>10}{tot['unsure']:>16}{tot['pass']:>14}")
 
             print("\nEnter field number to inspect (or 0 for All, q to return):")
-            raw = input("> ").strip().lower()
+            raw = T.prompt("› ").strip().lower()
             if raw in ("q", "back", "exit", ""):
                 break
             if raw == "0":
@@ -294,7 +298,7 @@ def _candidates_screen(home: Path):
                 print("    s) Submit top candidate in this list")
                 print("    0) Back to field list")
 
-                act = input("> ").strip().lower()
+                act = T.prompt("› ").strip().lower()
                 if act in ("0", "b", "back", "q", ""):
                     break
                 elif act == "c":
@@ -311,7 +315,7 @@ def _candidates_screen(home: Path):
                     _pause()
                 elif act == "s":
                     top = cands[0]
-                    yn = input(f"Submit top candidate {top.alpha_id} (sharpe={top.sharpe}, fitness={top.fitness})? [y/N] ").strip().lower()
+                    yn = T.prompt(f"Submit top candidate {top.alpha_id} (sharpe={top.sharpe}, fitness={top.fitness})? [y/N] ").strip().lower()
                     if yn == "y":
                         try:
                             ace, s = get_session()
@@ -362,7 +366,7 @@ def _candidates_screen(home: Path):
                             _pause()
                             break
                         elif sub_choice == "fail":
-                            reason = input("Reason for rejection: ").strip() or "manually skipped"
+                            reason = T.prompt("Reason for rejection: ").strip() or "manually skipped"
                             store.mark_check(cand.expr, "FAIL", reason)
                             print(f"Marked {cand.alpha_id} as check_fail.")
                             _pause()
@@ -390,7 +394,7 @@ def _settings_screen(home: Path):
         print(f"submit: mode={cfg.submit.mode}  max_per_day={cfg.submit.max_per_day}  max_per_run={cfg.submit.max_per_run}  "
               f"show_polling={cfg.submit.show_polling}")
         print(f"saved focus: {cfg['run'].get('focus') or '(none - whole pool)'}")
-        print(f"llm: provider={cfg.llm.provider}  model={cfg.llm.model or '(default)'}  fallback={cfg.llm.fallback}")
+        print(f"llm: provider={cfg.llm.provider}  metadata_mode={cfg.llm.metadata_mode}  model={cfg.llm.model or '(default)'}")
         choice = _prompt_choice("Settings", [
             ("Change pack", "pack"),
             ("Change submit.mode", "submit_mode"),
@@ -399,6 +403,7 @@ def _settings_screen(home: Path):
             ("Toggle submit polling output", "show_polling"),
             ("Change saved field focus (used when you press Enter in the Run screen)", "focus"),
             ("Change llm.provider", "llm_provider"),
+            ("Change llm.metadata_mode (template or explicit AI)", "metadata_mode"),
             ("Edit config.yaml directly (opens the path)", "edit"),
             ("Set any key=value", "raw"),
         ])
@@ -438,29 +443,33 @@ def _settings_screen(home: Path):
             if val:
                 data["submit"]["mode"] = val
         elif choice == "max_per_day":
-            val = input("submit.max_per_day (integer): ").strip()
+            val = T.prompt("submit.max_per_day (integer): ").strip()
             if val.isdigit():
                 data["submit"]["max_per_day"] = int(val)
         elif choice == "max_per_run":
-            val = input("submit.max_per_run (integer, 0 = no limit): ").strip()
+            val = T.prompt("submit.max_per_run (integer, 0 = no limit): ").strip()
             if val.isdigit():
                 data["submit"]["max_per_run"] = int(val)
         elif choice == "show_polling":
             data["submit"]["show_polling"] = not bool(data["submit"].get("show_polling", True))
             print(f"\nsubmit.show_polling = {data['submit']['show_polling']}")
         elif choice == "focus":
-            val = input("focus, comma-separated in order (field ids, combo, combo:<field>; blank = none): ").strip()
+            val = T.prompt("focus, comma-separated in order (field ids, combo, combo:<field>; blank = none): ").strip()
             data.setdefault("run", {})["focus"] = PA.normalize_focus(val)
         elif choice == "llm_provider":
             val = _prompt_choice("llm.provider", [(p, p) for p in CFG.LLM_PROVIDERS], allow_back=True)
             if val:
                 data["llm"]["provider"] = val
+        elif choice == "metadata_mode":
+            val = _prompt_choice("llm.metadata_mode", [(mode, mode) for mode in ("template", "ai")], allow_back=True)
+            if val:
+                data["llm"]["metadata_mode"] = val
         elif choice == "edit":
             print(f"\nEdit this file, then come back: {CFG.config_path(home)}")
             _pause()
             continue
         elif choice == "raw":
-            kv = input("key.path=value: ").strip()
+            kv = T.prompt("key.path=value: ").strip()
             if kv:
                 data = CFG.deep_merge(data, CFG.parse_overrides([kv]))
         problems = CFG.validate(data)
@@ -498,7 +507,7 @@ def _jump_screen(home: Path):
         "skipped (not simulated). Anything already simulated, errored, or submitted is "
         "never touched or lost. Enter 0 to undo this and include everything again."
     )
-    raw = input("Start from # (0 = reset to include everything): ").strip()
+    raw = T.prompt("Start from # (0 = reset to include everything): ").strip()
     if not raw.isdigit():
         print("cancelled")
         return
@@ -508,44 +517,61 @@ def _jump_screen(home: Path):
 
 def main_menu(home_arg=None):
     home = CFG.resolve_home(home_arg)
+    history_file = home / "history"
+    print("ALPHAPILOT  |  WorldQuant BRAIN research agent")
+    print("Use one of the 13 slash commands. Type ? or / for the command reference.\n")
     while True:
         cfg_exists = CFG.config_path(home).exists()
-        banner(["alphapilot", f"home: {home}"])
         if not cfg_exists:
-            print("(not set up yet - start with Quick setup)")
+            print("Not configured yet - choose Quick setup to connect.\n")
         else:
             try:
                 cfg = CFG.load_config(home)
                 db = C._state_db_for(home, cfg)
                 try:
                     _info = PA.resolve_pack(cfg.pack, C._pack_dirs(Path(C.__file__).resolve(), home))
-                    print(f"active pack: {_info.key}   ({_info.path})")
+                    print(f"Pack  {_info.key}")
                 except PA.PackError as _e:
-                    print(f"active pack: {cfg.pack}   !! {str(_e).splitlines()[0]}")
+                    print(f"Pack  {cfg.pack} | unavailable: {str(_e).splitlines()[0]}")
                 if db.exists():
                     store = ST.Store(db)
-                    print(f"progress: {store.counts()}")
+                    counts = store.counts()
+                    print("Work  " + " | ".join(f"{k} {v}" for k, v in counts.items()))
                     store.close()
                 else:
-                    print("progress: (not started yet for this pack)")
+                    print("Work  not started")
             except Exception:
                 pass
 
-        choice = _prompt_choice("Main menu", [
-            ("Quick setup (init + login + doctor)", "setup"),
-            ("Run (simulate / submit - resumable)", "run"),
-            ("Candidates (review & submit eligible alphas by field)", "candidates"),
-            ("Status", "status"),
-            ("Fields (per-field progress)", "fields"),
-            ("View errors", "errors"),
-            ("Retry errors (reset failed simulations back to pending)", "retry"),
-            ("Submissions history", "submissions"),
-            ("Jump to alpha # (skip ahead / reset)", "jump"),
-            ("Settings (pack, submit mode, LLM provider, ...)", "settings"),
-            ("Doctor (diagnostics)", "doctor"),
-            ("Reset progress", "reset"),
-            ("Exit", "exit"),
-        ], allow_back=False)
+        try:
+            choice = _prompt_choice("Main menu", [
+                ("Quick setup (init + login + doctor)", "setup"),
+                ("Run (simulate / submit - resumable)", "run"),
+                ("Candidates (review & submit eligible alphas by field)", "candidates"),
+                ("Status", "status"),
+                ("Fields (per-field progress)", "fields"),
+                ("View errors", "errors"),
+                ("Retry errors (reset failed simulations back to pending)", "retry"),
+                ("Submissions history", "submissions"),
+                ("Jump to alpha # (skip ahead / reset)", "jump"),
+                ("Settings (pack, submit mode, LLM provider, ...)", "settings"),
+                ("Doctor (diagnostics)", "doctor"),
+                ("Reset progress", "reset"),
+                ("Exit", "exit"),
+            ], allow_back=False, history_file=history_file, record=True)
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            return 0
+
+        if choice == "?" or choice == "/" or (choice and choice.startswith("/")):
+            from .agent_cli import CommandTerminal, command_reference
+            if choice in ("?", "/"):
+                print(command_reference())
+                continue
+            if asyncio.run(CommandTerminal(home).execute(choice)):
+                print("Bye.")
+                return 0
+            continue
 
         try:
             if choice == "setup":
@@ -577,7 +603,10 @@ def main_menu(home_arg=None):
                 print("Bye.")
                 return 0
         except KeyboardInterrupt:
-            print("\n(interrupted - back to menu)")
+            print("\nCancelled - back to menu")
+        except EOFError:
+            print("\nBye.")
+            return 0
         except Exception as e:
-            print(f"\n!! {type(e).__name__}: {e}")
+            print(f"\n✕ {e}")
             _pause()

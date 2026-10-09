@@ -24,7 +24,7 @@ Then, one time only:
 ```bash
 docker compose run --rm alphapilot init      # creates ./data/config.yaml
 docker compose run --rm alphapilot login     # asks for BRAIN email/password once
-docker compose run --rm alphapilot doctor    # checks session, fields, operators, LLM, 1 test simulation
+docker compose run --rm alphapilot doctor    # checks session, fields, operators, 1 test simulation
 ```
 
 `login` will trigger a face-check link the first time (or whenever your
@@ -97,6 +97,7 @@ pip install -e .
 export PYTHONPATH=/path/to/ACE_API__Gold_
 alphapilot          # menu
 alphapilot run      # direct
+alphapilot chat     # optional model-backed research chat
 ```
 
 Same commands, same `./data` rule, same everything — just no container
@@ -104,23 +105,43 @@ around it.
 
 ---
 
-## 3. The menu, option by option
+## 3. The interactive command shell
 
 `alphapilot` (or `docker compose run --rm alphapilot` with no extra word)
-opens this:
+opens the modern deterministic command shell. The only slash commands are
+`/setup`, `/run`, `/candidates`, `/status`, `/fields`, `/errors`, `/retry`,
+`/history`, `/jump`, `/settings`, `/doctor`, `/reset`, and `/exit`. Type `?`
+or `/` for descriptions and usage examples. For example, `/run --simulate`
+runs without submitting and `/candidates --field <field> --submit` follows
+the existing eligibility and submission checks. Direct CLI commands remain
+available for scripts. Free-form model chat is isolated behind
+`alphapilot chat` and can be installed with `pip install -e '.[ai]'`.
+
+After a slash command runs, it becomes the active context. Type `?` to see
+only that command's valid next options, or use `/back` to return to the main
+13-command context. For example, after `/run`, `?` shows `/simulate`,
+`/submit`, `/resume`, and `/dry-run`; these nested options invoke the same
+deterministic run handler. A bare `/` always shows the global 13-command
+reference. Context help and executable options are generated from one shared
+registry.
+
+The original numbered menu contains:
 
 ```
 Main menu
   1) Quick setup (init + login + doctor)
   2) Run (simulate / submit - resumable)
-  3) Status
-  4) View errors
-  5) Submissions history
-  6) Jump to alpha # (skip ahead / reset)
-  7) Settings (pack, submit mode, LLM provider, ...)
-  8) Doctor (diagnostics)
-  9) Reset progress
-  10) Exit
+  3) Candidates (review & submit eligible alphas by field)
+  4) Status
+  5) Fields (per-field progress)
+  6) View errors
+  7) Retry errors
+  8) Submissions history
+  9) Jump to alpha # (skip ahead / reset)
+  10) Settings (pack, submit mode, optional AI metadata, ...)
+  11) Doctor (diagnostics)
+  12) Reset progress
+  13) Exit
 ```
 
 - **Quick setup** — re-runs init + login + doctor. Only needed once, or if
@@ -140,13 +161,15 @@ Main menu
   with alpha ID, name, and category.
 - **Jump to alpha #** — see §6.
 - **Settings** — change the active dataset pack, submit mode, daily submit
-  cap, or LLM provider. Saved to `config.yaml` for every future run.
+  cap, or optional AI metadata provider. Saved to `config.yaml` for future runs.
 - **Doctor** — full diagnostic pass: session, dataset fields exist and are
-  the right type, which operators your account actually has, whether the
-  LLM description provider works, and one real (harmless) test simulation.
+  the right type, which operators your account actually has, and one real
+  (harmless) test simulation. Add `--check-model` to explicitly test an AI
+  metadata provider.
   Run this whenever something feels off, or after switching datasets.
-- **Reset progress** — wipes local progress for the *currently active pack
-  only*. Never touches, deletes, or unsubmits anything already on BRAIN.
+- **Reset progress** — clears local pending/simulation/error progress for the
+  *currently active pack only*. Submitted rows and submission history are
+  retained; configuration, credentials, and other packs are not changed.
 
 ## 4. The same thing, without the menu (for scripting / cron)
 
@@ -180,7 +203,7 @@ Picked either when you choose **Run** in the menu, or fixed permanently in
 | Mode | Behaviour |
 |---|---|
 | `off` | Simulate only. Never submits anything. |
-| `dry` | Runs the full pipeline (official check, writes a description) but only *prints* what it would submit. Nothing is sent to BRAIN. Good for a first look at a new pack. |
+| `dry` | Runs the full pipeline (official check, writes deterministic template metadata by default) but only *prints* what it would submit. Nothing is sent to BRAIN. |
 | `ask` | Pauses on each qualifying alpha, shows you the name/description, waits for y/N. |
 | `auto` | Submits automatically — but still capped by `submit.max_per_day` (default 1) and `submit.max_per_run`. It will never exceed those even across multiple runs in one day, since the cap is tracked in the saved state, not in memory. |
 
@@ -303,8 +326,8 @@ sometimes reuses a stale build layer otherwise.
   `Ctrl-C` is always safe; re-run to resume.
 - **A lot of errors** → see §7.
 - **Not sure what's wrong at all** → run **Doctor**. It's cheap (one test
-  simulation) and checks session, fields, operators, and the LLM provider
-  in one pass, and tells you exactly which one is the problem.
+  simulation) and checks the BRAIN session, fields, and operators. Add
+  `--check-model` only when diagnosing the optional AI metadata provider.
 - **Something this doc doesn't cover, or doesn't match what you see** →
   paste me the exact command and output; I'll fix the tool (and this file)
   to match.

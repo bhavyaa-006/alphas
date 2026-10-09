@@ -1,7 +1,7 @@
 """
 alphapilot pack: FND6 "Company Fundamental Data for Equity" · GLB / D1 / MINVOL1M
 
-Built for the D1 Power Pool Oct'26 Consultants theme (28 Sep - 11 Oct 2026, 1X multiplier).
+Bu Power Pool Oct'26 Consultants theme (28 Sep - 11 Oct 2026, 1X multiplier).
 Competition rules this pack is written to respect:
   * Delay 1 only.
   * Single data category: every expression uses ONLY fields from the fundamental

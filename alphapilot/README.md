@@ -1,6 +1,6 @@
 # alphapilot
 
-Resumable automation for WorldQuant BRAIN: build a pool of alpha expressions
+An interactive deterministic command center and resumable automation for WorldQuant BRAIN: build a pool of alpha expressions
 from a dataset "pack", simulate them, and (optionally) submit the best ones -
 stopping after a configurable number per day. Runs the same way locally or in
 Docker; safe to stop and resume at any point.
@@ -33,7 +33,7 @@ Docker; safe to stop and resume at any point.
 pip install -e .
 export PYTHONPATH=/path/to/ACE_API__Gold_
 
-alphapilot                       # launches the interactive menu (same as `alphapilot menu`)
+alphapilot                       # launches the deterministic command shell
 ```
 
 Or drive it directly (same commands the menu calls under the hood):
@@ -41,13 +41,39 @@ Or drive it directly (same commands the menu calls under the hood):
 ```bash
 alphapilot init                 # creates ./data/config.yaml
 alphapilot login                # stores your BRAIN email/password in ./data/.env
-alphapilot doctor               # verifies session, fields, operators, LLM, 1 smoke simulation
+alphapilot doctor               # verifies session, fields, operators, 1 smoke simulation
 alphapilot run                  # the real thing - resumable, Ctrl-C anytime
 alphapilot status                # counts, top alphas, most common errors
 alphapilot submissions           # everything submitted so far
 alphapilot jump 520              # start from the 520th alpha (skips earlier PENDING ones only)
 alphapilot jump 0                # undo that - include the whole pool again
 ```
+
+## Interactive command shell and optional AI
+
+The no-argument CLI and `alphapilot menu` open a modern command shell. Its
+only slash commands are `/setup`, `/run`, `/candidates`, `/status`, `/fields`,
+`/errors`, `/retry`, `/history`, `/jump`, `/settings`, `/doctor`, `/reset`,
+and `/exit`. Type `?` or `/` at the prompt to display their descriptions and
+usage examples. For example, `/run --simulate` runs without submitting and
+`/candidates --field <field> --submit` submits an eligible candidate through
+the existing safeguards. Input is dispatched deterministically; it is never
+sent to a model for interpretation. The original numbered menu remains
+available through `alphapilot legacy-menu`.
+
+Free-form research chat remains an explicit optional feature: run
+`alphapilot chat`. It streams from the configured OpenAI-compatible chat API
+and can inspect the pack, preview expressions, read local results, and run
+bounded simulation batches with submission disabled. Install chat support
+with `pip install -e '.[ai]'`; ordinary commands do not import the chat agent
+or require model credentials.
+
+AI-generated submission metadata is optional. The default
+`llm.metadata_mode: template` uses deterministic local text. Set it to `ai` to
+request model-generated metadata; missing credentials or provider failures
+stop that submission clearly without substituting template output.
+`alphapilot doctor --check-model` explicitly tests the configured provider;
+ordinary `doctor` does not make a model request.
 
 `--home` (or `$ALPHAPILOT_HOME`) picks where everything lives - default `./data`.
 Each pack gets its own progress file under `data/state/<pack>.db`, so
@@ -76,8 +102,8 @@ This is a command-line tool, not a web service: it listens on no port and
 prints its output in the terminal running `docker compose run`. `run` gives
 the container an interactive terminal for the menu and login prompts; direct
 commands such as `status` can also be run without prompts. The image needs
-outbound access to the WorldQuant BRAIN API (and to the configured LLM provider
-if you select one). The ACE API source folder is copied into the image at
+outbound access to the WorldQuant BRAIN API. Optional `chat` and AI metadata
+features also need a configured model provider. The ACE API source folder is copied into the image at
 build time; it is not a running service or a host port.
 
 **About the face check in Docker:** the container has no camera or browser,
@@ -152,7 +178,8 @@ Key settings:
 | `submit.max_per_day` | hard cap, tracked in `submit.timezone`'s calendar day, survives restarts |
 | `submit.max_per_run` | extra cap for a single `run` invocation |
 | `llm.provider` | `template` (no network/key needed), `openrouter`, `mistral`, `openai`, `ollama`, `custom` |
-| `llm.fallback` | provider to try if the main one fails (or `template`) |
+| `llm.metadata_mode` | `template` (default, deterministic) or `ai` (explicit model-generated submission metadata) |
+| `llm.fallback` | fallback used by the optional metadata helper |
 
 Run `alphapilot init` to generate a fully-commented `config.yaml`.
 
@@ -167,9 +194,10 @@ llm:
 
 Set the corresponding environment variable (`MISTRAL_API_KEY`, etc.) - in
 Docker, put it in a `.env` file next to `docker-compose.yml` or export it
-before `docker compose run`. `llm.provider: template` needs no key at all and
-is the automatic fallback if the real provider ever fails, so a bad key never
-stops a run.
+before `docker compose run`. `llm.provider: template` needs no key. Ordinary
+simulation and submission use deterministic metadata and never call a model.
+Set `llm.metadata_mode: ai` to request AI metadata; provider or key failures
+stop that submission clearly without silently substituting output.
 
 ## Submission safety
 
@@ -179,7 +207,7 @@ stops a run.
   status, rate limit), the whole run halts rather than risk a second submit.
 - `submit.max_per_day` is enforced from `state.db`, not from memory, so it
   holds even if you stop and restart the process, or run it from cron.
-- `submit.mode: dry` runs the entire pipeline (checks, LLM description) and
+- `submit.mode: dry` runs the entire pipeline (checks, deterministic description by default) and
   logs what it *would* submit, without ever calling PATCH or POST.
 
 ## Repository layout

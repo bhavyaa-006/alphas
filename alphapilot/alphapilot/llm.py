@@ -23,16 +23,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
 from typing import Optional
 
 import requests
+
+from .metadata import FALLBACK_CATEGORY, Metadata, fields_in_expression, template_metadata
 
 ALLOWED_CATEGORIES = [
     "PRICE_REVERSION", "PRICE_MOMENTUM", "VOLUME", "FUNDAMENTAL",
     "ANALYST", "PRICE_VOLUME", "RELATION", "SENTIMENT",
 ]
-FALLBACK_CATEGORY = "PRICE_MOMENTUM"
 
 PROVIDER_DEFAULTS = {
     "openrouter": {"base_url": "https://openrouter.ai/api/v1/chat/completions", "model": "mistralai/mistral-small-3.2-24b-instruct", "api_key_env": "OPENROUTER_API_KEY"},
@@ -40,15 +40,6 @@ PROVIDER_DEFAULTS = {
     "openai": {"base_url": "https://api.openai.com/v1/chat/completions", "model": "gpt-4o-mini", "api_key_env": "OPENAI_API_KEY"},
     "ollama": {"base_url": "http://localhost:11434/v1/chat/completions", "model": "mistral", "api_key_env": ""},
 }
-
-
-@dataclass
-class Metadata:
-    name: str
-    category: str
-    description: str
-    tags: list
-    source: str  # provider name that actually produced it, or "template"
 
 
 class LLMError(Exception):
@@ -121,10 +112,6 @@ def _clean(x, limit=700):
     return re.sub(r"\s+", " ", str(x or "")).strip()[:limit]
 
 
-def fields_in_expression(expr: str, field_glossary: dict) -> list:
-    return [f for f in field_glossary if re.search(rf"\b{re.escape(f)}\b", expr)]
-
-
 def build_prompt(expr: str, field_glossary: dict, settings_text: str, stats: dict, allowed_categories):
     fields = fields_in_expression(expr, field_glossary)
     field_lines = "\n".join(f"- {f}: {field_glossary[f]}" for f in fields) or "(no known field names matched - describe the expression on its own)"
@@ -160,29 +147,6 @@ Return a JSON object with exactly these keys:
 
 Rules: describe only what the expression actually computes; do not invent data sources; do not promise returns; do not mention any numbers that were not given."""
     return system, user
-
-
-def template_metadata(expr: str, field_glossary: dict, pack_name: str) -> Metadata:
-    """Deterministic, offline fallback. Always succeeds."""
-    fields = fields_in_expression(expr, field_glossary)
-    field_txt = "; ".join(f"{f} ({field_glossary[f]})" for f in fields) or "the pack's data fields"
-    short = hashlib.md5(expr.encode()).hexdigest()[:6]
-    description = (
-        f"Idea: Cross-sectional signal built from the {pack_name} dataset, aiming to rank stocks by "
-        "the information those fields carry, using time-series and/or cross-sectional transformations "
-        "to keep the signal stable.\n"
-        f"Rationale for data used: {field_txt}.\n"
-        f"Rationale for operators used: The expression `{expr}` standardises or ranks the raw fields so "
-        "they are comparable, and applies the listed operators to capture changes, spreads, or agreement "
-        "between them while limiting outliers."
-    )
-    return Metadata(
-        name=f"{pack_name}_{short}"[:40],
-        category=FALLBACK_CATEGORY,
-        description=description,
-        tags=[pack_name, "auto"],
-        source="template",
-    )
 
 
 def _try_provider(prov: dict, expr, field_glossary, settings_text, stats) -> Metadata:
@@ -231,6 +195,18 @@ def generate_metadata(cfg, expr: str, field_glossary: dict, pack_name: str, sett
             meta = template_metadata(expr, field_glossary, pack_name)
             meta.source = f"template (primary failed: {primary_err}; fallback failed: {fallback_err})"
             return meta
+
+
+def generate_ai_metadata(cfg, expr: str, field_glossary: dict, pack_name: str, settings_text: str,
+                         stats: Optional[dict] = None) -> Metadata:
+    """Generate metadata with a configured model, failing clearly rather than silently substituting a template."""
+    prov = resolve_provider_config(cfg)
+    if prov["provider"] == "template":
+        raise LLMError("AI metadata was requested, but llm.provider is 'template'. Configure a model provider or use llm.metadata_mode=template.")
+    return _try_provider(
+        {**prov, "temperature": cfg.llm.temperature, "timeout_s": cfg.llm.timeout_s},
+        expr, field_glossary, settings_text, stats or {},
+    )
 
 
 def preflight(cfg) -> dict:

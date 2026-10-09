@@ -72,6 +72,10 @@ class DailyLimitReached(BrainError):
     pass
 
 
+class SessionCancelled(BrainError):
+    pass
+
+
 @dataclass
 class SubmitOutcome:
     ok: bool
@@ -131,11 +135,13 @@ def authenticate_once(session, base_url: str):
     raise AuthError(f"Unexpected response from /authentication: HTTP {r.status_code}: {r.text[:300]}")
 
 
-def complete_persona(session, persona_url: str, timeout_min: float, poll_seconds: float, on_waiting=None) -> None:
+def complete_persona(session, persona_url: str, timeout_min: float, poll_seconds: float, on_waiting=None, cancel_event=None) -> None:
     """Poll the persona URL (no input() / stdin) until it succeeds or timeout_min elapses."""
     deadline = time.time() + timeout_min * 60
     attempt = 0
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise SessionCancelled("Authentication was cancelled.")
         r = session.post(persona_url)
         if r.status_code == 201:
             return
@@ -144,16 +150,22 @@ def complete_persona(session, persona_url: str, timeout_min: float, poll_seconds
             raise PersonaTimeout(persona_url)
         if on_waiting:
             on_waiting(attempt, deadline - time.time())
-        time.sleep(poll_seconds)
+        if cancel_event is not None:
+            if cancel_event.wait(poll_seconds):
+                raise SessionCancelled("Authentication was cancelled.")
+        else:
+            time.sleep(poll_seconds)
 
 
-def ensure_session(ace, cfg, home, force_relogin: bool = False, on_persona_link=None, on_waiting=None):
+def ensure_session(ace, cfg, home, force_relogin: bool = False, on_persona_link=None, on_waiting=None, cancel_event=None):
     """
     Returns an authenticated ace_lib.SingleSession, reusing a saved session
     when it still has plenty of time left, otherwise (re-)authenticating -
     including the face check when BRAIN asks for it.
     """
     s = ace.SingleSession()
+    if cancel_event is not None and cancel_event.is_set():
+        raise SessionCancelled("Authentication was cancelled.")
     # requests has no default timeout.  A single stalled socket otherwise
     # bypasses every higher-level polling deadline and leaves claimed rows in
     # `simulating` until the next process restart.
@@ -194,6 +206,7 @@ def ensure_session(ace, cfg, home, force_relogin: bool = False, on_persona_link=
             timeout_min=cfg.session.persona_timeout_min,
             poll_seconds=cfg.session.persona_poll_seconds,
             on_waiting=on_waiting,
+            cancel_event=cancel_event,
         )
         # BRAIN needs ~2 minutes to propagate the face-check session server-side.
         # Jumping straight into simulations after a face check reliably causes errors,
@@ -207,7 +220,11 @@ def ensure_session(ace, cfg, home, force_relogin: bool = False, on_persona_link=
         waited = 0
         while waited < _FACE_CHECK_COOLDOWN_S:
             chunk = min(_COOLDOWN_ANNOUNCE_EVERY, _FACE_CHECK_COOLDOWN_S - waited)
-            time.sleep(chunk)
+            if cancel_event is not None:
+                if cancel_event.wait(chunk):
+                    raise SessionCancelled("Authentication was cancelled.")
+            else:
+                time.sleep(chunk)
             waited += chunk
             remaining = _FACE_CHECK_COOLDOWN_S - waited
             if remaining > 0:
@@ -234,7 +251,7 @@ def ensure_session(ace, cfg, home, force_relogin: bool = False, on_persona_link=
     return s
 
 
-def install_into(ace, cfg, home, on_persona_link=None, on_waiting=None):
+def install_into(ace, cfg, home, on_persona_link=None, on_waiting=None, cancel_event=None):
     """
     Monkeypatch ace_lib.start_session so that ace_lib's OWN internal re-login
     (inside check_session_and_relogin, called by simulate_alpha_list_multi
@@ -243,7 +260,8 @@ def install_into(ace, cfg, home, on_persona_link=None, on_waiting=None):
     """
 
     def _replacement():
-        return ensure_session(ace, cfg, home, force_relogin=True, on_persona_link=on_persona_link, on_waiting=on_waiting)
+        return ensure_session(ace, cfg, home, force_relogin=True, on_persona_link=on_persona_link,
+                              on_waiting=on_waiting, cancel_event=cancel_event)
 
     ace.start_session = _replacement
 

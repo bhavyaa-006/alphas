@@ -21,13 +21,38 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from . import brain_client as BC
-from . import llm as LLM
+from .metadata import template_metadata
 from .state import Store
 from .util import LOGGER, fmt_duration, say, today_str
 
 
 class EngineHalt(Exception):
     """Raised to stop the whole run cleanly (daily limit reached and configured to stop, submit halted, etc.)."""
+
+
+class EngineCancelled(Exception):
+    """Cooperative cancellation requested by the interactive agent."""
+
+
+class MetadataGenerationError(Exception):
+    """Explicit AI metadata was requested but the model could not provide it."""
+
+
+def _submission_metadata(cfg, cand, pack):
+    if getattr(cfg.llm, "metadata_mode", "template") == "ai":
+        # Keep model imports and provider setup out of every ordinary run.
+        from .llm import LLMError, generate_ai_metadata
+        try:
+            return generate_ai_metadata(
+                cfg, cand.expr, pack.fields, pack.name, _settings_text(pack),
+                {"sharpe": cand.sharpe, "fitness": cand.fitness, "turnover": cand.turnover},
+            )
+        except LLMError as exc:
+            raise MetadataGenerationError(
+                f"AI metadata was requested but could not be generated: {exc}. "
+                "No submission was made; switch llm.metadata_mode to 'template' or restore the model configuration."
+            ) from exc
+    return template_metadata(cand.expr, pack.fields, pack.name)
 
 
 @dataclass
@@ -80,11 +105,14 @@ def _post_sim_config(ace) -> dict:
     return dict(ace.DEFAULT_CONFIG)
 
 
-def _poll_simulation(ace, s, sim_id_or_url: str, timeout_min: float, max_retry_after_s: float):
+def _poll_simulation(ace, s, sim_id_or_url: str, timeout_min: float, max_retry_after_s: float, cancel_event=None, deadline=None):
     """Poll a single /simulations/{id} to completion. Returns the raw final JSON (never raises on ERROR status)."""
     url = sim_id_or_url if sim_id_or_url.startswith("http") else f"{ace.brain_api_url}/simulations/{sim_id_or_url}"
-    deadline = time.time() + timeout_min * 60
+    own_deadline = time.time() + timeout_min * 60
+    deadline = min(own_deadline, deadline) if deadline is not None else own_deadline
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise EngineCancelled()
         if time.time() >= deadline:
             return {"status": "TIMEOUT", "message": f"gave up polling after {timeout_min:.0f} minutes"}
         r = s.get(url)
@@ -96,7 +124,12 @@ def _poll_simulation(ace, s, sim_id_or_url: str, timeout_min: float, max_retry_a
                 except (TypeError, ValueError):
                     retry_after = 1
                 wait = min(max_retry_after_s, max(1.0, retry_after))
-                time.sleep(min(wait, max(0.0, deadline - time.time())))
+                delay = min(wait, max(0.0, deadline - time.time()))
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        raise EngineCancelled()
+                else:
+                    time.sleep(delay)
                 continue
             return {"status": "ERROR", "message": f"poll HTTP {r.status_code}: {r.text[:400]}"}
         wait = 0.0
@@ -112,17 +145,28 @@ def _poll_simulation(ace, s, sim_id_or_url: str, timeout_min: float, max_retry_a
                 return {"status": "ERROR", "message": f"invalid poll response JSON: {e}; body={r.text[:400]}"}
         if time.time() > deadline:
             return {"status": "TIMEOUT", "message": f"gave up polling after {timeout_min:.0f} minutes"}
-        time.sleep(min(wait, max_retry_after_s, max(0.0, deadline - time.time())))
+        delay = min(wait, max_retry_after_s, max(0.0, deadline - time.time()))
+        if cancel_event is not None:
+            if cancel_event.wait(delay):
+                raise EngineCancelled()
+        else:
+            time.sleep(delay)
 
 
-def _simulate_one(ace, s, alpha_dict: dict, timeout_min: float, max_retry_after_s: float) -> dict:
+def _simulate_one(ace, s, alpha_dict: dict, timeout_min: float, max_retry_after_s: float, cancel_event=None, deadline=None) -> dict:
     """Single-alpha simulation that KEEPS the error detail (unlike ace_lib.simulate_single_alpha, which discards it)."""
+    if cancel_event is not None and cancel_event.is_set():
+        raise EngineCancelled()
+    if deadline is not None and time.time() >= deadline:
+        return {"alpha_id": None, "simulate_data": alpha_dict, "error": "batch deadline exceeded before simulation started"}
     resp = ace.start_simulation(s, alpha_dict)
+    if cancel_event is not None and cancel_event.is_set():
+        raise EngineCancelled()
     if resp.status_code == 429:
         raise BC.RateLimited(retry_after=float(resp.headers.get("Retry-After", 0) or 0), detail=resp.text[:200])
     if resp.status_code // 100 != 2:
         return {"alpha_id": None, "simulate_data": alpha_dict, "error": f"HTTP {resp.status_code}: {resp.text[:400]}"}
-    final = _poll_simulation(ace, s, resp.headers["Location"], timeout_min, max_retry_after_s)
+    final = _poll_simulation(ace, s, resp.headers["Location"], timeout_min, max_retry_after_s, cancel_event, deadline)
     alpha_id = final.get("alpha")
     if not alpha_id:
         loc = final.get("location") or {}
@@ -133,24 +177,30 @@ def _simulate_one(ace, s, alpha_dict: dict, timeout_min: float, max_retry_after_
     return {"alpha_id": alpha_id, "simulate_data": alpha_dict, "error": None}
 
 
-def _simulate_batch_with_fallback(ace, s, cfg, alpha_dicts: list) -> list:
+def _simulate_batch_with_fallback(ace, s, cfg, alpha_dicts: list, cancel_event=None) -> list:
     """
     Try one multi-simulation for the whole batch. If BRAIN rejects the batch
     as a whole (all alpha_id=None - the all-or-nothing bug described in the
     module docstring), re-simulate each expression individually so the
     good ones are still recovered and the bad one is pinpointed.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        raise EngineCancelled()
+    batch_deadline = time.time() + cfg.simulation.batch_timeout_min * 60
     if len(alpha_dicts) == 1:
-        return [_simulate_one(ace, s, alpha_dicts[0], cfg.simulation.batch_timeout_min, cfg.api.max_retry_after_s)]
-
+        return [_simulate_one(ace, s, alpha_dicts[0], cfg.simulation.batch_timeout_min,
+                              cfg.api.max_retry_after_s, cancel_event, batch_deadline)]
     resp = ace.start_simulation(s, alpha_dicts)
+    if cancel_event is not None and cancel_event.is_set():
+        raise EngineCancelled()
     if resp.status_code == 429:
         raise BC.RateLimited(retry_after=float(resp.headers.get("Retry-After", 0) or 0), detail=resp.text[:200])
     if resp.status_code // 100 != 2:
         detail = f"HTTP {resp.status_code}: {resp.text[:400]}"
         return [{"alpha_id": None, "simulate_data": a, "error": detail} for a in alpha_dicts]
 
-    parent = _poll_simulation(ace, s, resp.headers["Location"], cfg.simulation.batch_timeout_min, cfg.api.max_retry_after_s)
+    parent = _poll_simulation(ace, s, resp.headers["Location"], cfg.simulation.batch_timeout_min,
+                             cfg.api.max_retry_after_s, cancel_event, batch_deadline)
     children = parent.get("children") or []
     if not children:
         detail = parent.get("message") or f"status={parent.get('status')}"
@@ -159,7 +209,8 @@ def _simulate_batch_with_fallback(ace, s, cfg, alpha_dicts: list) -> list:
     results = []
     any_missing = False
     for child_id, alpha_dict in zip(children, alpha_dicts):
-        child = _poll_simulation(ace, s, child_id, cfg.simulation.batch_timeout_min, cfg.api.max_retry_after_s)
+        child = _poll_simulation(ace, s, child_id, cfg.simulation.batch_timeout_min,
+                                 cfg.api.max_retry_after_s, cancel_event, batch_deadline)
         alpha_id = child.get("alpha")
         if alpha_id:
             results.append({"alpha_id": alpha_id, "simulate_data": alpha_dict, "error": None})
@@ -188,7 +239,8 @@ def _simulate_batch_with_fallback(ace, s, cfg, alpha_dicts: list) -> list:
         if r["alpha_id"] is not None:
             fixed.append(r)
             continue
-        fixed.append(_simulate_one(ace, s, r["simulate_data"], cfg.simulation.batch_timeout_min, cfg.api.max_retry_after_s))
+        fixed.append(_simulate_one(ace, s, r["simulate_data"], cfg.simulation.batch_timeout_min,
+                                   cfg.api.max_retry_after_s, cancel_event, batch_deadline))
     return fixed
 
 
@@ -204,7 +256,7 @@ def _fetch_stats(ace, s, alpha_id: str, simulate_data: dict) -> dict:
     return {"stats": stats, "failed_tests": failed_tests}
 
 
-def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optional[Callable] = None, max_batches: Optional[int] = None, focus=None) -> RunStats:
+def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optional[Callable] = None, max_batches: Optional[int] = None, focus=None, cancel_event=None) -> RunStats:
     rs = RunStats(started_at=time.time())
     # consecutive_errors must survive across calls to this function, not just across
     # batches within one call - cmd_run invokes this with max_batches=1 in a loop, so a
@@ -219,6 +271,8 @@ def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optiona
         say(f"recovered {n_requeued} expression(s) left mid-batch by a previous interrupted run")
 
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise EngineCancelled()
         if max_batches is not None and rs.batches_run >= max_batches:
             break
         batch = store.claim_batch(cfg.simulation.batch_size, cfg.simulation.max_attempts, focus=focus)
@@ -227,7 +281,13 @@ def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optiona
 
         alpha_dicts = [_make_alpha_dict(ace, pack, e) for e in batch]
         try:
-            results = _simulate_batch_with_fallback(ace, s, cfg, alpha_dicts)
+            results = _simulate_batch_with_fallback(ace, s, cfg, alpha_dicts, cancel_event)
+        except EngineCancelled:
+            store.conn.execute(
+                "UPDATE alphas SET status='pending' WHERE expr IN (%s)" % ",".join("?" * len(batch)), batch
+            )
+            store.conn.commit()
+            raise
         except BC.RateLimited as e:
             # put the batch back to pending so it's retried, then decide stop/wait
             store.conn.execute(
@@ -237,7 +297,16 @@ def run_simulation_batches(ace, s, cfg, pack, store: Store, on_progress: Optiona
             if cfg.simulation.on_daily_limit == "wait" and e.retry_after and rate_limit_retries < cfg.simulation.max_attempts:
                 rate_limit_retries += 1
                 say(f"rate limited - waiting {fmt_duration(e.retry_after)} before retrying")
-                time.sleep(min(e.retry_after, 3600))
+                delay = min(e.retry_after, 3600)
+                if cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        store.conn.execute(
+                            "UPDATE alphas SET status='pending' WHERE expr IN (%s)" % ",".join("?" * len(batch)), batch
+                        )
+                        store.conn.commit()
+                        raise EngineCancelled()
+                else:
+                    time.sleep(delay)
                 continue
             store.log_event("rate_limited", str(e))
             raise EngineHalt(f"Simulation rate/daily limit reached: {e}. Re-run later to continue - progress is saved.") from e
@@ -470,10 +539,10 @@ def run_submission_cycle(ace, s, cfg, pack, store: Store, ask_fn: Optional[Calla
         else:
             say("    submitting directly (submit.precheck=false) - the platform decides")
 
-        meta = LLM.generate_metadata(
-            cfg, cand.expr, pack.fields, pack.name, _settings_text(pack),
-            {"sharpe": cand.sharpe, "fitness": cand.fitness, "turnover": cand.turnover},
-        )
+        try:
+            meta = _submission_metadata(cfg, cand, pack)
+        except MetadataGenerationError as exc:
+            raise EngineHalt(str(exc)) from exc
         say(f"    description via: {meta.source}")
 
         if mode == "dry":
@@ -493,7 +562,7 @@ def run_submission_cycle(ace, s, cfg, pack, store: Store, ask_fn: Optional[Calla
         )
         if resp.status_code // 100 != 2:
             say(f"    !! could not save name/description (HTTP {resp.status_code}: {resp.text[:200]}) - retrying with the built-in template text")
-            meta = LLM.template_metadata(cand.expr, pack.fields, pack.name)
+            meta = template_metadata(cand.expr, pack.fields, pack.name)
             resp = ace.set_alpha_properties(
                 s, cand.alpha_id, name=meta.name, category=meta.category,
                 regular_desc=meta.description, tags=meta.tags,
@@ -591,16 +660,16 @@ def submit_candidate_now(ace, s, cfg, pack, store: Store, cand: Alpha) -> tuple[
     if st is None:
         return False, f"Could not read platform status for {cand.alpha_id}; not submitting while its state is unknown"
 
-    meta = LLM.generate_metadata(
-        cfg, cand.expr, pack.fields, pack.name, _settings_text(pack),
-        {"sharpe": cand.sharpe, "fitness": cand.fitness, "turnover": cand.turnover},
-    )
+    try:
+        meta = _submission_metadata(cfg, cand, pack)
+    except MetadataGenerationError as exc:
+        return False, str(exc)
     resp = ace.set_alpha_properties(
         s, cand.alpha_id, name=meta.name, category=meta.category,
         regular_desc=meta.description, tags=meta.tags,
     )
     if resp.status_code // 100 != 2:
-        meta = LLM.template_metadata(cand.expr, pack.fields, pack.name)
+        meta = template_metadata(cand.expr, pack.fields, pack.name)
         resp = ace.set_alpha_properties(
             s, cand.alpha_id, name=meta.name, category=meta.category,
             regular_desc=meta.description, tags=meta.tags,

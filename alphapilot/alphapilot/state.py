@@ -447,6 +447,13 @@ class Store:
                 )
         return cur.rowcount
 
+    def reset_progress(self) -> int:
+        """Clear per-alpha simulation state while retaining submitted records/history and metadata."""
+        with self._tx():
+            cur = self.conn.execute("DELETE FROM alphas WHERE status != 'submitted'")
+            self.conn.execute("DELETE FROM events")
+        return cur.rowcount
+
     def mark_check(self, expr, result: str, detail: str):
         with self._tx():
             self.conn.execute(

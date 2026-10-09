@@ -66,6 +66,7 @@ def default_config() -> dict:
         },
         "llm": {
             "provider": "template",       # openrouter | mistral | openai | ollama | custom | template
+            "metadata_mode": "template",  # template | ai (AI metadata is an explicit opt-in)
             "model": "",                  # empty = provider default
             "base_url": "",               # only needed for provider: custom
             "api_key_env": "",            # empty = provider default (e.g. MISTRAL_API_KEY)
@@ -219,6 +220,8 @@ def validate(c: dict) -> list:
         bad.append(f"submit.timezone {c['submit']['timezone']!r} is not a valid timezone name (e.g. America/New_York, UTC)")
     if c["llm"]["provider"] not in LLM_PROVIDERS:
         bad.append(f"llm.provider must be one of {LLM_PROVIDERS}")
+    if c["llm"].get("metadata_mode", "template") not in ("template", "ai"):
+        bad.append("llm.metadata_mode must be 'template' or 'ai'")
     if c["llm"]["provider"] == "custom" and not c["llm"].get("base_url"):
         bad.append("llm.provider 'custom' needs llm.base_url")
     return bad
