@@ -1,14 +1,20 @@
 """
-alphapilot pack: OTH176 "Nonlinear adaptive model" · JPN / D1 / TOP1600
+alphapilot pack: MDL262 "DNN prediction of fundamentals" · USA / D1 / TOP3000
 
-This is the dataset pack used for the first alphapilot runs. It was produced
-the way every pack is meant to be produced: hand Claude the Data Explorer
-screenshot for the dataset, the operator list your account has, and the
-simulation settings screenshot, and ask it to write one of these files.
+Dataset notes (from the Data Explorer screenshot):
+  * All fields are MATRIX type (one value per instrument per day) -> no vec_* wrapping.
+  * Coverage 73-100%, date coverage 100%, so backfill / staleness ideas are included.
+  * Fields mix unit-free ratios (earnings yield, earnings/cap, profitability) with
+    currency-level predictions (predicted long-term debt, predicted pretax income), so
+    level-based signals lean on rank / ts_zscore / ratios rather than raw magnitudes.
+  * Pyramid theme multiplier 1.3.
 
-Nothing outside this file is dataset-specific - the CLI, the BRAIN client,
-the LLM description writer and the submission logic are all generic and
-never need to change when you add a new dataset.
+Settings follow the BRAIN simulation-settings screenshot: Fast Expression, Equity,
+USA / delay 1 / TOP3000, Sector neutralization, decay 4, truncation 0.08, pasteurization ON,
+unit handling VERIFY, NaN handling ON, test period 0Y0M, max trade OFF.
+
+Limits mirrored from the other packs: <= 3 raw fields and <= 8 operators per expression,
+and every called function must be in ALLOWED_OPERATORS.
 """
 from __future__ import annotations
 
@@ -16,12 +22,12 @@ import random
 import re
 from itertools import combinations, permutations
 
-PACK_NAME = "oth176_jpn"
-PACK_DESCRIPTION = "OTH176 Nonlinear adaptive model (6 composite model scores), JPN/D1/TOP1600"
+PACK_NAME = "mdl262_usa"
+PACK_DESCRIPTION = "MDL262 DNN prediction of fundamentals (8 predictive-model fields), USA/D1/TOP3000"
 
 SETTINGS = {
-    "region": "JPN",
-    "universe": "TOP1600",
+    "region": "USA",
+    "universe": "TOP3000",
     "delay": 1,
     "decay": 4,
     "neutralization": "SECTOR",
@@ -34,15 +40,14 @@ SETTINGS = {
 }
 
 FIELDS = {
-    "oth176_maltahc_eq_score": "Model Composite Score (baseline composite model score)",
-    "oth176_malta_eq_score": "Model Composite Score (baseline composite model score)",
-    "oth176_lmt_close_eq_score": "Model Composite Score (baseline composite model score)",
-    "oth176_eq_medium": "Score of the Medium model (a medium-term model trained on a rolling 12-month window)",
-    "oth176_hc_eq_hedge": (
-        "Score of the Hedge model (a hedge model developed to provide downside insurance to the "
-        "baseline scenario, using periods different from the current environment)"
-    ),
-    "oth176_hc_eq_seasonality": "Score of the Seasonality model (a seasonal model trained on a rolling 10-year window of the same calendar months)",
+    "mdl262_earnings_yield1": "Earnings Yield of Predictive models (variant 1)",
+    "mdl262_earnings_yield2": "Earnings Yield of Predictive models (variant 2)",
+    "mdl262_earnings_yield3": "Earnings Yield of Predictive models (variant 3)",
+    "mdl262_earnings_cap2": "Earnings to cap ratio of Predictive models",
+    "mdl262_rasv2splitprofitabilityebitd_q_profitability3": "3rd profitability field of Earnings before Interest, Tax and Depreciation",
+    "mdl262_aacr_trkdpitdeltapredict_funda_mada": "Mean Absolute Deviation of scaled actual value of Accounts Receivable",
+    "mdl262_compustatpredictivedlttq_prediction": "Market-implied predicted Long-term Debt (DLTTQ, quarterly) with 1-day delay",
+    "mdl262_piq_compustatdeltapredict_funda_predict": "Market-implied predicted value of Pretax Income (Compustat PIQ) as of close (D0)",
 }
 
 MAX_RAW_FIELDS = 3
@@ -58,7 +63,7 @@ ALLOWED_OPERATORS = [
     "ts_count_nans", "ts_covariance", "ts_decay_linear", "ts_delay", "ts_delta",
     "ts_entropy", "ts_max", "ts_mean", "ts_min", "ts_min_diff",
     "ts_min_max_cps", "ts_min_max_diff", "ts_product", "ts_quantile", "ts_rank",
-    "ts_regression", "ts_returns", "ts_scale", "ts_skewness", "ts_std_dev",
+    "ts_regression", "ts_scale", "ts_skewness", "ts_std_dev",
     "ts_step", "ts_sum", "ts_target_tvr_decay", "ts_zscore",
     "normalize", "quantile", "rank", "regression_proj", "scale",
     "vector_neut", "vector_proj", "winsorize", "zscore",
@@ -77,7 +82,9 @@ GENIUS_OPERATORS = [
 ]
 
 _FIELD_NAMES = list(FIELDS.keys())
-mal_hc, mal, lmt, med, hedge, seas = _FIELD_NAMES
+ey1, ey2, ey3, ecap, prof3, mada, dltt, piq = _FIELD_NAMES
+YIELDS = [ey1, ey2, ey3]
+GROUPS = ["industry", "subindustry"]
 
 
 def _Z(x):
@@ -99,12 +106,8 @@ def _generate_candidates():
     def add(expr, tag):
         candidates.setdefault(expr.strip(), tag)
 
-    short_w = [5, 10, 20]
-    medium_w = [40, 60, 120]
-    long_w = [180, 252]
-    all_w = short_w + medium_w + long_w
+    all_w = [5, 10, 20, 40, 60, 120, 180, 252]
     pair_w = [10, 20, 60, 120, 252]
-    reg_w = [60, 120, 252]
 
     fields = _FIELD_NAMES
     pairs = list(combinations(fields, 2))
@@ -117,24 +120,25 @@ def _generate_candidates():
         add(f"-rank({f})", "level")
         add(f"zscore({f})", "level")
         add(f"-zscore({f})", "level")
-        add(f"normalize({f})", "level")
-        add(f"-normalize({f})", "level")
         add(f"normalize({f},useStd=true)", "level")
         add(f"rank(winsorize({f},std=4))", "level")
         add(f'rank(quantile({f},driver="gaussian"))', "level")
         add(f"rank(abs(zscore({f})))", "level")
-        add(f"-rank(abs(zscore({f})))", "level")
+        add(f"rank(signed_power({f},0.5))", "level")
+        add(f"rank(sigmoid(zscore({f})))", "level")
 
     # 2. coverage / staleness
     for f in fields:
-        for d in [20, 60, 120]:
+        for d in [5, 20, 60, 120]:
             add(f"rank(ts_backfill({f},{d}))", "backfill")
             add(f"-rank(ts_backfill({f},{d}))", "backfill")
+        for d in [60, 120]:
+            add(f"rank(ts_count_nans({f},{d}))", "coverage")
+            add(f"-rank(ts_count_nans({f},{d}))", "coverage")
         add(f"rank(days_from_last_change({f}))", "staleness")
         add(f"-rank(days_from_last_change({f}))", "staleness")
-        add(f"rank(last_diff_value({f},60))", "staleness")
+        add(f"rank(subtract({f},last_diff_value({f},20)))", "staleness")
         add(f"rank(subtract({f},last_diff_value({f},60)))", "staleness")
-        add(f"rank(subtract({f},last_diff_value({f},120)))", "staleness")
 
     # 3. single-field time-series level / trend
     for f in fields:
@@ -166,45 +170,71 @@ def _generate_candidates():
             add(f"rank(ts_skewness({f},{d}))", "ts_shape")
             add(f"rank(ts_entropy({f},{d}))", "ts_shape")
 
-    # 5. cross-model static relationships (pairs)
+    # 5. scale-free growth (important for the currency-level prediction fields)
+    for f in fields:
+        for d in [5, 20, 60, 120, 252]:
+            add(f"rank(divide(ts_delta({f},{d}),abs(ts_mean({f},{d}))))", "growth")
+            add(f"-rank(divide(ts_delta({f},{d}),abs(ts_mean({f},{d}))))", "growth")
+            add(f"rank(divide(ts_delta({f},{d}),ts_std_dev({f},{d})))", "growth")
+            add(f"rank(divide({f},ts_mean({f},{d})))", "vs_own_mean")
+            add(f"-rank(divide({f},ts_mean({f},{d})))", "vs_own_mean")
+            add(f"rank(subtract(ts_mean({f},{max(d // 2, 2)}),ts_mean({f},{d})))", "mean_cross")
+
+    # 6. earnings-yield ensemble (three variants of the same idea)
+    y12, y13, y23 = (ey1, ey2), (ey1, ey3), (ey2, ey3)
+    add(f"rank(add({_Z(ey1)},{_Z(ey2)},{_Z(ey3)}))", "yield_ens")
+    add(f"rank(min({_Z(ey1)},{_Z(ey2)},{_Z(ey3)}))", "yield_ens")
+    add(f"rank(max({_Z(ey1)},{_Z(ey2)},{_Z(ey3)}))", "yield_ens")
+    for d in [20, 60, 120, 252]:
+        add(f"rank(ts_zscore(add({_Z(ey1)},{_Z(ey2)},{_Z(ey3)}),{d}))", "yield_ens")
+        add(f"rank(ts_delta(add({_Z(ey1)},{_Z(ey2)},{_Z(ey3)}),{d}))", "yield_ens")
+        add(f"rank(ts_rank(add({_Z(ey1)},{_Z(ey2)},{_Z(ey3)}),{d}))", "yield_ens")
+    for a, b in (y12, y13, y23):
+        add(f"rank(abs({_spread(a, b)}))", "yield_disagree")
+        add(f"-rank(abs({_spread(a, b)}))", "yield_disagree")
+        add(f"rank(multiply({_Z(a)},{_Z(b)}))", "yield_disagree")
+
+    # 7. cross-field ratios (unit-free: predicted income vs predicted debt, etc.)
+    for a, b in ordered_pairs:
+        add(f"rank(divide({a},abs({b})))", "ratio")
+        for d in [60, 120, 252]:
+            add(f"rank(ts_zscore(divide({a},abs({b})),{d}))", "ratio_ts")
+            add(f"rank(ts_delta(divide({a},abs({b})),{d}))", "ratio_ts")
+
+    # 8. cross-field static relationships (pairs)
     for a, b in pairs:
         add(f"rank(add(rank({a}),rank({b})))", "pair_static")
         add(f"rank(multiply(rank({a}),rank({b})))", "pair_static")
         add(f"rank({_blend(a, b)})", "pair_static")
-        add(f"rank(multiply(zscore({a}),zscore({b})))", "pair_static")
+        add(f"rank(multiply({_Z(a)},{_Z(b)}))", "pair_static")
         add(f"rank(abs({_spread(a, b)}))", "pair_static")
-        add(f"-rank(abs({_spread(a, b)}))", "pair_static")
-        add(f"rank(min(zscore({a}),zscore({b})))", "pair_minmax")
-        add(f"rank(max(zscore({a}),zscore({b})))", "pair_minmax")
-
+        add(f"rank(min({_Z(a)},{_Z(b)}))", "pair_minmax")
+        add(f"rank(max({_Z(a)},{_Z(b)}))", "pair_minmax")
     for a, b in ordered_pairs:
         add(f"rank(subtract(rank({a}),rank({b})))", "pair_spread")
         add(f"rank({_spread(a, b)})", "pair_spread")
 
-    # 6. consensus / disagreement regimes
+    # 9. consensus regimes
     for a, b in pairs:
         add(
-            f"if_else(and(zscore({a})>0.5,zscore({b})>0.5),1,"
-            f"if_else(and(zscore({a})<-0.5,zscore({b})<-0.5),-1,0))",
+            f"if_else(and({_Z(a)}>0.5,{_Z(b)}>0.5),1,"
+            f"if_else(and({_Z(a)}<-0.5,{_Z(b)}<-0.5),-1,0))",
             "consensus",
         )
 
-    # 7. triple-model composites
+    # 10. triple composites
     for a, b, c in triples:
-        add(f"rank(add(zscore({a}),zscore({b}),zscore({c})))", "triple")
-        add(f"rank(min(zscore({a}),zscore({b}),zscore({c})))", "triple")
-        add(f"rank(max(zscore({a}),zscore({b}),zscore({c})))", "triple")
-        add(f"rank(subtract({_blend(a, b)},zscore({c})))", "triple")
-        add(f"rank(subtract({_blend(a, c)},zscore({b})))", "triple")
-        add(f"rank(subtract({_blend(b, c)},zscore({a})))", "triple")
-        for d in [20, 60, 120]:
-            add(f"rank(ts_zscore(add(zscore({a}),zscore({b}),zscore({c})),{d}))", "triple_ts")
-        add(f"rank(ts_delta(add(zscore({a}),zscore({b}),zscore({c})),20))", "triple_ts")
-        add(f"rank(ts_decay_linear(add(zscore({a}),zscore({b}),zscore({c})),20))", "triple_ts")
+        add(f"rank(add({_Z(a)},{_Z(b)},{_Z(c)}))", "triple")
+        add(f"rank(min({_Z(a)},{_Z(b)},{_Z(c)}))", "triple")
+        add(f"rank(max({_Z(a)},{_Z(b)},{_Z(c)}))", "triple")
+        add(f"rank(subtract({_blend(a, b)},{_Z(c)}))", "triple")
+        for d in [60, 120]:
+            add(f"rank(ts_zscore(add({_Z(a)},{_Z(b)},{_Z(c)}),{d}))", "triple_ts")
 
-    # 8. pair-spread / pair-blend time-series
+    # 11. pair-spread / blend time-series
     for a, b in pairs:
         s_ab = _spread(a, b)
+        b_ab = _blend(a, b)
         for d in pair_w:
             add(f"rank(ts_mean({s_ab},{d}))", "spread_ts")
             add(f"rank(ts_delta({s_ab},{d}))", "spread_ts")
@@ -212,14 +242,12 @@ def _generate_candidates():
             add(f"rank(ts_zscore({s_ab},{d}))", "spread_ts")
             add(f"-rank(ts_zscore({s_ab},{d}))", "spread_ts")
             add(f"rank(ts_rank({s_ab},{d}))", "spread_ts")
-            add(f"rank(ts_decay_linear({s_ab},{d}))", "spread_ts")
-        b_ab = _blend(a, b)
         for d in [10, 20, 60, 120]:
             add(f"rank(ts_zscore({b_ab},{d}))", "blend_ts")
             add(f"rank(ts_delta({b_ab},{d}))", "blend_ts")
             add(f"rank(ts_rank({b_ab},{d}))", "blend_ts")
 
-    # 9. cross-model correlation / covariance
+    # 12. cross-field correlation / covariance
     for a, b in pairs:
         for d in [20, 60, 120, 252]:
             add(f"rank(ts_corr({a},{b},{d}))", "ts_corr")
@@ -227,27 +255,22 @@ def _generate_candidates():
             add(f"rank(ts_covariance({a},{b},{d}))", "ts_cov")
             add(f"-rank(ts_covariance({a},{b},{d}))", "ts_cov")
 
-    # 10. cross-model time-series regression
+    # 13. cross-field time-series regression
     for y, x in ordered_pairs:
-        for d in reg_w:
+        for d in [60, 120, 252]:
             add(f"rank(ts_regression({y},{x},{d},lag=0,rettype=0))", "ts_reg_resid")
             add(f"rank(ts_regression({y},{x},{d},lag=0,rettype=2))", "ts_reg_slope")
-    for a, b in pairs:
-        for d in [60, 120, 252]:
-            add(f"rank(ts_regression({a},{b},{d},lag=0,rettype=6))", "ts_reg_r2")
 
-    # 11. cross-sectional orthogonalisation (Genius)
+    # 14. orthogonalisation (Genius)
     for y, x in ordered_pairs:
-        add(f"rank(vector_neut(zscore({y}),zscore({x})))", "neut")
-        add(f"rank(subtract(zscore({y}),regression_proj(zscore({y}),zscore({x}))))", "neut")
-    for y, x in ordered_pairs:
+        add(f"rank(vector_neut({_Z(y)},{_Z(x)}))", "neut")
+        add(f"rank(subtract({_Z(y)},regression_proj({_Z(y)},{_Z(x)})))", "neut")
         for d in [20, 60]:
-            add(f"rank(ts_zscore(vector_neut(zscore({y}),zscore({x})),{d}))", "neut_ts")
+            add(f"rank(ts_zscore(vector_neut({_Z(y)},{_Z(x)}),{d}))", "neut_ts")
 
-    # 12. group-relative signals
-    group_names = ["industry", "subindustry"]
+    # 15. group-relative signals
     for f in fields:
-        for g in group_names:
+        for g in GROUPS:
             add(f"group_rank(rank({f}),{g})", "group_level")
             add(f"group_neutralize(rank({f}),{g})", "group_level")
             add(f"group_zscore(zscore({f}),{g})", "group_level")
@@ -258,25 +281,23 @@ def _generate_candidates():
                 add(f"group_zscore(ts_zscore({f},{d}),{g})", "group_ts")
                 add(f"group_scale(rank(ts_rank({f},{d})),{g})", "group_ts")
             add(f"rank(group_backfill({f},{g},60))", "group_backfill")
-            add(f"rank(group_backfill({f},{g},120))", "group_backfill")
 
-    # 13. group-relative model spreads
+    # 16. group-relative field spreads
     for a, b in pairs:
         s_ab = _spread(a, b)
-        for g in group_names:
+        for g in GROUPS:
             add(f"group_rank(rank({s_ab}),{g})", "group_spread")
             add(f"group_neutralize(rank({s_ab}),{g})", "group_spread")
             add(f"group_zscore({s_ab},{g})", "group_spread")
-        add(f"group_rank(rank(ts_zscore({s_ab},60)),industry)", "group_spread")
 
-    # 14. group-bucket templates
+    # 17. group-bucket templates
     for bucket_field, target_field in ordered_pairs:
-        bucket_group = f'bucket(rank({bucket_field}),range="0, 1, 0.1")'
-        add(f"group_rank(rank({target_field}),{bucket_group})", "bucket")
-        add(f"group_neutralize(rank({target_field}),{bucket_group})", "bucket")
-        add(f"group_zscore(zscore({target_field}),{bucket_group})", "bucket")
+        bg = f'bucket(rank({bucket_field}),range="0, 1, 0.1")'
+        add(f"group_rank(rank({target_field}),{bg})", "bucket")
+        add(f"group_neutralize(rank({target_field}),{bg})", "bucket")
+        add(f"group_zscore(zscore({target_field}),{bg})", "bucket")
 
-    # 15. hump / turnover control
+    # 18. hump / turnover control
     for f in fields:
         add(f"hump(rank(ts_rank({f},20)),hump=0.01)", "hump")
         add(f"hump(rank(ts_zscore({f},40)),hump=0.01)", "hump")
@@ -284,48 +305,41 @@ def _generate_candidates():
     for a, b in pairs:
         add(f"hump(rank(ts_zscore({_spread(a, b)},60)),hump=0.01)", "hump")
 
-    # 16. trade_when
+    # 19. trade_when
     for f in fields:
         add(f"trade_when(days_from_last_change({f})<=5,rank({f}),-1)", "trade_when")
         add(f"trade_when(abs(ts_zscore({f},60))>1,rank({f}),-1)", "trade_when")
         add(f"trade_when(ts_rank({f},60)>0.7,rank({f}),ts_rank({f},60)<0.3)", "trade_when")
+        add(f"trade_when(ts_zscore({f},20)>1,rank(ts_delta({f},5)),-1)", "trade_when")
     for a, b in ordered_pairs:
         add(f"trade_when(days_from_last_change({a})<=5,rank({_spread(a, b)}),-1)", "trade_when")
 
-    # 17. decayed / smoothed model signals
+    # 20. decayed / smoothed signals
     for f in fields:
         for d in [10, 20, 40, 60]:
             add(f"rank(ts_decay_linear(ts_zscore({f},{d}),20))", "decay_combo")
             add(f"rank(ts_decay_linear(ts_rank({f},{d}),20))", "decay_combo")
             add(f"rank(ts_decay_linear(ts_delta({f},{d}),20))", "decay_combo")
 
-    # 18. model momentum x model level
+    # 21. level x momentum
     for f in fields:
-        for d in [20, 60, 120]:
+        for d in [5, 20, 60, 120]:
             add(f"rank(multiply(rank({f}),rank(ts_delta({f},{d}))))", "level_x_mom")
             add(f"rank(subtract(rank({f}),rank(ts_delta({f},{d}))))", "level_x_mom")
             add(f"rank(add(rank({f}),rank(ts_rank({f},{d}))))", "level_x_mom")
 
-    # 19. cross-model momentum
+    # 22. cross-field momentum
     for a, b in ordered_pairs:
         for d in [20, 60]:
             add(f"rank(multiply(rank({a}),rank(ts_delta({b},{d}))))", "cross_mom")
             add(f"rank(subtract(ts_zscore({a},{d}),ts_zscore({b},{d})))", "cross_mom")
 
-    # 20. stable long-horizon signals
-    for f in fields:
-        for d in [120, 180, 252]:
-            add(f"rank(ts_mean({f},{d}))", "long_horizon")
-            add(f"rank(ts_zscore({f},{d}))", "long_horizon")
-            add(f"rank(ts_decay_linear({f},{d}))", "long_horizon")
-            add(f"rank(ts_av_diff({f},{d}))", "long_horizon")
-
     return candidates
 
 
 def _validate_local(expr: str) -> bool:
-    """Cheap offline filter mirroring the pack's own limits (kept in sync with packs_api.validate_expression)."""
-    if "vec_" in expr and not any(v in expr for v in ("vec_avg(", "vec_sum(")):
+    """Cheap offline filter mirroring the pack's own limits."""
+    if any(n not in ALLOWED_OPERATORS for n in re.findall(r"\b([A-Za-z_][A-Za-z_0-9]*)\s*\(", expr)):
         return False
     used = {f for f in FIELDS if re.search(rf"\b{re.escape(f)}\b", expr)}
     if not used or len(used) > MAX_RAW_FIELDS:
@@ -349,7 +363,7 @@ def build_pool(seed: int, pool_size: int) -> dict:
     all_candidates = {e: t for e, t in _generate_candidates().items() if _validate_local(e)}
     if len(all_candidates) < pool_size:
         raise ValueError(
-            f"oth176_jpn pack only has {len(all_candidates)} valid candidates, "
+            f"mdl262_usa pack only has {len(all_candidates)} valid candidates, "
             f"requested pool_size={pool_size}"
         )
 

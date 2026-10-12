@@ -1,19 +1,17 @@
 """
-alphapilot pack: pv87 "Aggregated dataset" · USA / D1 / TOP3000
+alphapilot pack: OTH176 "Nonlinear adaptive model" · USA / D1 / TOP3000
 
-This is a dataset pack for alphapilot. It was produced the way every pack is
-meant to be produced: hand Claude the Data Explorer screenshot for the dataset,
-the operator list your account has, and the simulation settings screenshot,
-and ask it to write one of these files.
+Dataset notes (from the Data Explorer screenshot):
+  * All fields are MATRIX type -> no vec_* wrapping.
+  * 8 model-score fields (composite, medium-term, seasonality, hedge variants; the "hc"
+    variants are kept as separate fields) plus 2 market-cap fields in US dollars.
+  * Cross-model blends / spreads / regressions use the 8 score fields only; the cap fields
+    enter as size signals (log level, size buckets) and as bucket keys for the scores.
+  * Pyramid theme multiplier 1.3, instrument coverage 87%, date coverage 100%.
 
-Nothing outside this file is dataset-specific - the CLI, the BRAIN client,
-the LLM description writer and the submission logic are all generic and
-never need to change when you add a new dataset.
-
-Theme: D1 Power Pool (28 Sep'26 - 11 Oct'26, 1X). Requirements: delay 1, single
-data category (price-volume or fundamental). pv87 is a Price Volume dataset, and
-every expression uses only pv87 fields plus pv1 group/support fields (sector,
-industry, subindustry, exchange, market), which the theme explicitly allows.
+Settings follow the BRAIN simulation-settings screenshot: Fast Expression, Equity,
+USA / delay 1 / TOP3000, Sector neutralization, decay 4, truncation 0.08, pasteurization ON,
+unit handling VERIFY, NaN handling ON, test period 0Y0M, max trade OFF.
 """
 from __future__ import annotations
 
@@ -21,8 +19,8 @@ import random
 import re
 from itertools import combinations, permutations
 
-PACK_NAME = "pv87_usa"
-PACK_DESCRIPTION = "pv87 Aggregated dataset (AFFOPS analyst estimate counts and change-ratio counts), USA/D1/TOP3000"
+PACK_NAME = "oth176_usa"
+PACK_DESCRIPTION = "OTH176 Nonlinear adaptive model (8 model scores + 2 market-cap fields), USA/D1/TOP3000"
 
 SETTINGS = {
     "region": "USA",
@@ -39,21 +37,19 @@ SETTINGS = {
 }
 
 FIELDS = {
-    "pv87_2_affops_af_matrix_all_chngratio_number": (
-        "count number of all change ratio of Adjusted Funds from Operations per Share (AFFOPS); change ratio = (current value - previous value) / (fabs(current value)/2 + fabs(previous value)/2)"
+    "oth176_malta_eq_score": "Model Composite Score",
+    "oth176_maltahc_eq_score": "Model Composite Score",
+    "oth176_lmt_close_eq_score": "Model Composite Score",
+    "oth176_eq_medium": "Score of the Medium model (a medium-term model trained on a rolling 12-month window)",
+    "oth176_hc_eq_medium": "Score of the Medium model (a medium-term model trained on a rolling 12-month window)",
+    "oth176_eq_seasonality": "Score of the Seasonality model (a seasonal model trained on a rolling 10-year window of the same calendar months)",
+    "oth176_hc_eq_seasonality": "Score of the Seasonality model (a seasonal model trained on a rolling 10-year window of the same calendar months)",
+    "oth176_eq_hedge": (
+        "Score of the Hedge model (a hedge model developed to provide downside insurance to the "
+        "baseline scenario, using periods different from the current environment)"
     ),
-    "pv87_2_affops_af_matrix_all_number": "count number of estimates (once for one analyst) of Adjusted Funds from Operations per Share (AFFOPS)",
-    "pv87_2_affops_af_matrix_p1_b_chngratio_number": (
-        "count number of all change ratio of Adjusted Funds from Operations per Share (AFFOPS); change ratio = (current value - previous value) / (fabs(current value)/2 + fabs(previous value)/2)"
-    ),
-    "pv87_2_affops_af_matrix_p1_b_number": "count number of estimates (once for one analyst) of Adjusted Funds from Operations per Share (AFFOPS)",
-    "pv87_2_affops_af_matrix_p1_chngratio_number": (
-        "count number of all change ratio of Adjusted Funds from Operations per Share (AFFOPS); change ratio = (current value - previous value) / (fabs(current value)/2 + fabs(previous value)/2)"
-    ),
-    "pv87_2_affops_af_matrix_p1_number": "count number of estimates (once for one analyst) of Adjusted Funds from Operations per Share (AFFOPS)",
-    "pv87_2_affops_qf_matrix_all_chngratio_number": (
-        "count number of all change ratio of Adjusted Funds from Operations per Share (AFFOPS); change ratio = (current value - previous value) / (fabs(current value)/2 + fabs(previous value)/2)"
-    ),
+    "oth176_close_eq_cap": "Market cap in US dollars for US and local currency for each region",
+    "oth176_eq_mktcap": "Market Cap. US dollars for US, local currency for each region",
 }
 
 MAX_RAW_FIELDS = 3
@@ -88,12 +84,9 @@ GENIUS_OPERATORS = [
 ]
 
 _FIELD_NAMES = list(FIELDS.keys())
-(
-    af_all_chg, af_all_n,
-    af_p1b_chg, af_p1b_n,
-    af_p1_chg, af_p1_n,
-    qf_all_chg,
-) = _FIELD_NAMES
+SCORES = _FIELD_NAMES[:8]
+CAPS = _FIELD_NAMES[8:]
+cap1, cap2 = CAPS
 
 
 def _Z(x):
@@ -123,9 +116,9 @@ def _generate_candidates():
     reg_w = [60, 120, 252]
 
     fields = _FIELD_NAMES
-    pairs = list(combinations(fields, 2))
-    ordered_pairs = list(permutations(fields, 2))
-    triples = list(combinations(fields, 3))
+    pairs = list(combinations(SCORES, 2))
+    ordered_pairs = list(permutations(SCORES, 2))
+    triples = list(combinations(SCORES, 3))
 
     # 1. single-field level
     for f in fields:
@@ -182,7 +175,7 @@ def _generate_candidates():
             add(f"rank(ts_skewness({f},{d}))", "ts_shape")
             add(f"rank(ts_entropy({f},{d}))", "ts_shape")
 
-    # 5. cross-field static relationships (pairs)
+    # 5. cross-model static relationships (pairs)
     for a, b in pairs:
         add(f"rank(add(rank({a}),rank({b})))", "pair_static")
         add(f"rank(multiply(rank({a}),rank({b})))", "pair_static")
@@ -205,7 +198,7 @@ def _generate_candidates():
             "consensus",
         )
 
-    # 7. triple-field composites
+    # 7. triple-model composites
     for a, b, c in triples:
         add(f"rank(add(zscore({a}),zscore({b}),zscore({c})))", "triple")
         add(f"rank(min(zscore({a}),zscore({b}),zscore({c})))", "triple")
@@ -235,7 +228,7 @@ def _generate_candidates():
             add(f"rank(ts_delta({b_ab},{d}))", "blend_ts")
             add(f"rank(ts_rank({b_ab},{d}))", "blend_ts")
 
-    # 9. cross-field correlation / covariance
+    # 9. cross-model correlation / covariance
     for a, b in pairs:
         for d in [20, 60, 120, 252]:
             add(f"rank(ts_corr({a},{b},{d}))", "ts_corr")
@@ -243,7 +236,7 @@ def _generate_candidates():
             add(f"rank(ts_covariance({a},{b},{d}))", "ts_cov")
             add(f"-rank(ts_covariance({a},{b},{d}))", "ts_cov")
 
-    # 10. cross-field time-series regression
+    # 10. cross-model time-series regression
     for y, x in ordered_pairs:
         for d in reg_w:
             add(f"rank(ts_regression({y},{x},{d},lag=0,rettype=0))", "ts_reg_resid")
@@ -261,8 +254,7 @@ def _generate_candidates():
             add(f"rank(ts_zscore(vector_neut(zscore({y}),zscore({x})),{d}))", "neut_ts")
 
     # 12. group-relative signals
-    # pv1 group (support) fields - allowed by the theme alongside price-volume data
-    group_names = ["industry", "subindustry", "sector", "exchange", "market"]
+    group_names = ["industry", "subindustry"]
     for f in fields:
         for g in group_names:
             add(f"group_rank(rank({f}),{g})", "group_level")
@@ -277,7 +269,7 @@ def _generate_candidates():
             add(f"rank(group_backfill({f},{g},60))", "group_backfill")
             add(f"rank(group_backfill({f},{g},120))", "group_backfill")
 
-    # 13. group-relative field spreads
+    # 13. group-relative model spreads
     for a, b in pairs:
         s_ab = _spread(a, b)
         for g in group_names:
@@ -292,6 +284,25 @@ def _generate_candidates():
         add(f"group_rank(rank({target_field}),{bucket_group})", "bucket")
         add(f"group_neutralize(rank({target_field}),{bucket_group})", "bucket")
         add(f"group_zscore(zscore({target_field}),{bucket_group})", "bucket")
+
+    # 14b. market-cap / size signals (caps are USD levels -> log / ranks / buckets)
+    for c in CAPS:
+        add(f"rank(log({c}))", "size")
+        add(f"-rank(log({c}))", "size")
+        for d in [20, 60, 120, 252]:
+            add(f"rank(ts_delta(log({c}),{d}))", "size")
+            add(f"-rank(ts_delta(log({c}),{d}))", "size")
+            add(f"rank(ts_zscore(log({c}),{d}))", "size")
+        for sc in SCORES:
+            for nb in ["0.1", "0.25"]:
+                bk = f'bucket(rank({c}),range="0, 1, {nb}")'
+                add(f"group_neutralize(rank({sc}),{bk})", "size_bucket")
+                add(f"group_rank(rank({sc}),{bk})", "size_bucket")
+                add(f"group_zscore(zscore({sc}),{bk})", "size_bucket")
+            for d in [20, 60]:
+                bk = f'bucket(rank({c}),range="0, 1, 0.1")'
+                add(f"group_neutralize(rank(ts_delta({sc},{d})),{bk})", "size_bucket")
+                add(f"group_zscore(ts_zscore({sc},{d}),{bk})", "size_bucket")
 
     # 15. hump / turnover control
     for f in fields:
@@ -309,21 +320,21 @@ def _generate_candidates():
     for a, b in ordered_pairs:
         add(f"trade_when(days_from_last_change({a})<=5,rank({_spread(a, b)}),-1)", "trade_when")
 
-    # 17. decayed / smoothed field signals
+    # 17. decayed / smoothed model signals
     for f in fields:
         for d in [10, 20, 40, 60]:
             add(f"rank(ts_decay_linear(ts_zscore({f},{d}),20))", "decay_combo")
             add(f"rank(ts_decay_linear(ts_rank({f},{d}),20))", "decay_combo")
             add(f"rank(ts_decay_linear(ts_delta({f},{d}),20))", "decay_combo")
 
-    # 18. field momentum x field level
+    # 18. model momentum x model level
     for f in fields:
         for d in [20, 60, 120]:
             add(f"rank(multiply(rank({f}),rank(ts_delta({f},{d}))))", "level_x_mom")
             add(f"rank(subtract(rank({f}),rank(ts_delta({f},{d}))))", "level_x_mom")
             add(f"rank(add(rank({f}),rank(ts_rank({f},{d}))))", "level_x_mom")
 
-    # 19. cross-field momentum
+    # 19. cross-model momentum
     for a, b in ordered_pairs:
         for d in [20, 60]:
             add(f"rank(multiply(rank({a}),rank(ts_delta({b},{d}))))", "cross_mom")
@@ -366,7 +377,7 @@ def build_pool(seed: int, pool_size: int) -> dict:
     all_candidates = {e: t for e, t in _generate_candidates().items() if _validate_local(e)}
     if len(all_candidates) < pool_size:
         raise ValueError(
-            f"pv87_usa pack only has {len(all_candidates)} valid candidates, "
+            f"oth176_usa pack only has {len(all_candidates)} valid candidates, "
             f"requested pool_size={pool_size}"
         )
 
